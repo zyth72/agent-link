@@ -139,6 +139,36 @@ AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
 - HTTP 层限制：body 1..65536 字节、读取超时 10s、ask timeout 必须 `0 < t <= 3600`（核心 CLI 不受 3600 限制）。子端断开不会取消等待或删除请求；迟到答复保存为 `late=true`，仍可用 `get-request` 读取。
 - 协议与错误码、HostDriver 扩展方式、`--driver MODULE:OBJECT` 用法见 [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md)。Codex 驱动真实依赖 background-tasks 桌面桥，因此服务只能在父端环境启动；子端不得自行启动服务。
 
+## OMP 父端/子端（可选）
+
+OMP（oh-my-pi，Bun 运行时）可同时作为父端与子端；驱动、桥文件格式与验收范围见 [docs/HOST-PROTOCOL.md §6.1](docs/HOST-PROTOCOL.md#61-omp-父端驱动session_bridge_file)。
+
+```bash
+# 父端（必须）：OMP 驱动把通知追加到 <root>/omp-bridge/<binding_id>.jsonl
+python3 -m agent_link.host --root /abs/runtime --binding live-001 \
+  --credentials /abs/runtime/child-credentials.json \
+  --driver agent_link.hosts.omp:OmpHost
+
+# 父端主会话：独占桥文件并每秒轮询注入（deliverAs:"aside"、attribution:"agent"）
+AGENT_LINK_BRIDGE_FILE=/abs/runtime/omp-bridge/live-001.jsonl \
+AGENT_LINK_BINDING=live-001 \
+  omp --no-extensions --extension /abs/repo/extensions/omp/agent-link.ts
+
+# 子端（OMP）：仍只需凭据文件；工具与 Pi 版同名同语义
+AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
+  omp --no-extensions --extension /abs/repo/extensions/omp/agent-link.ts '<任务>'
+```
+
+- `<bridge>.lock`（单消费者锁）与 `<bridge>.cursor`（断点，含文件身份 dev/ino）由扩展自动维护：第二个消费者被拒绝，持有进程死亡后锁被回收一次，重启从断点续传并识别文件替换/截断。
+- 注入失败的事件保序阻塞其后事件直到重试成功；超长/非法事件记日志跳过；投递为 at-least-once，不承诺 exactly-once。
+- 不用宿主服务时，旧 CLI 路径把绑定里的 `notifier_path` 指向 `agent_link/hosts/omp_notifier.py`，并在运行 CLI 的环境设置两个变量（缺任一无则 exit 7，投递记 `failed_or_unknown`）：
+
+```bash
+AGENT_LINK_BRIDGE_FILE=/abs/runtime/omp-bridge/live-001.jsonl AGENT_LINK_BINDING=live-001 \
+  python3 -m agent_link --root /abs/runtime report \
+  --binding live-001 --message-id progress-001 --text "实现完成 60%"
+```
+
 ## 测试
 
 ```bash
@@ -146,7 +176,7 @@ cd /path/to/agent-intercom-workspace
 python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v
 ```
 
-测试使用模拟 notifier/driver（不发真实桌面消息）；Pi 扩展测试用 jiti 加载真实扩展、以真实 `agent_link.host` + notifier stub（走旧 CLI reply）做 loopback 闭环，并用 `pi --help` 探针扩展验证 Pi 真实加载（不调用模型）。覆盖：绑定不可重定向、ID 校验、幂等/冲突、重复回复保护、未知请求、超时与迟到回复、数据库重开恢复、两个独立进程并发冲突、模拟 notifier 失败后不重投；复审补充：慢通知不缩短真实截止时间、跨请求复用回复消息 ID 冲突（含并发）、timeout 变更冲突与非法 timeout 拒绝、deadline 边界（>=）与墙钟回拨下的 `late` 判定；宿主服务：认证/统一 JSON 错误/未知字段/方法/路径、body 与 timeout 上限、并发同消息单次投递、驱动失败不重投、跨 binding 隔离、服务重启重放不重投、请求体读超时 408、凭据不覆盖与只删自己的。
+测试使用模拟 notifier/driver（不发真实桌面消息）；Pi 扩展测试用 jiti 加载真实扩展、以真实 `agent_link.host` + notifier stub（走旧 CLI reply）做 loopback 闭环，并用 `pi --help` 探针扩展验证 Pi 真实加载（不调用模型）。OMP 扩展测试用 Bun 加载真实扩展：对真实 `agent_link.host` + OmpHost 闭环，父端桥六组无模型验收（重启恢复、失败保序、双消费者、会话切换、替换/截断、超长/非法事件），并用 `omp --mode rpc` 的 `dumpTools` 验证真实注册。覆盖：绑定不可重定向、ID 校验、幂等/冲突、重复回复保护、未知请求、超时与迟到回复、数据库重开恢复、两个独立进程并发冲突、模拟 notifier 失败后不重投；复审补充：慢通知不缩短真实截止时间、跨请求复用回复消息 ID 冲突（含并发）、timeout 变更冲突与非法 timeout 拒绝、deadline 边界（>=）与墙钟回拨下的 `late` 判定；宿主服务：认证/统一 JSON 错误/未知字段/方法/路径、body 与 timeout 上限、并发同消息单次投递、驱动失败不重投、跨 binding 隔离、服务重启重放不重投、请求体读超时 408、凭据不覆盖与只删自己的。
 
 ## 已知限制
 
@@ -156,7 +186,7 @@ python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v
 - 文件/数据库轮询有延迟（默认 0.1s），不承诺应用重启后通知可用，不实现 exactly-once 外部投递。
 - 墙钟回拨可能影响迟到判定；已记录 `wall_clock_jump_observed` 审计事件，但无法消除该限制。
 - 不实现 spawn/cancel；不绑定未启动的任务；不实现自动清理。
-- 本轮未用新宿主服务发送真实桌面通知，也未做 LLM 端到端工具调用（只验证扩展真实加载与工具执行）。
+- 本轮未用新宿主服务发送真实桌面通知，也未做 LLM 端到端工具调用（只验证扩展真实加载与工具执行）；OMP 侧未做真实会话注入验证（只验证真实加载/注册与无模型桥验收），`aside` 注入语义依据上游文档、未对本机版本逐条验证。
 
 ## Codex 后台运行配套
 

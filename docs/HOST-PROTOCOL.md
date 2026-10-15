@@ -14,7 +14,7 @@
 | 角色 | 持有 | 能力 |
 | --- | --- | --- |
 | 父端环境 | binding、`notifier_path`/driver、服务进程、token | 启动服务、接收通知、用旧 CLI `reply` 答复；可绑定、回复、查询任意本 binding 请求 |
-| 子端（如 Pi） | 凭据文件（endpoint + token） | 仅 `report` / `ask` / `get-request` / `capabilities`；不能指定父会话、不能 `bind`、不能 `reply` |
+| 子端（如 Pi/OMP） | 凭据文件（endpoint + token） | 仅 `report` / `ask` / `get-request` / `capabilities`；不能指定父会话、不能 `bind`、不能 `reply` |
 
 子端不需要 Codex 桌面、background-tasks 或任何桌面环境变量；它只需要凭据文件里的 loopback endpoint。父端默认 Codex 驱动依赖桌面桥，见 §5。
 
@@ -186,7 +186,29 @@ class HostDriver(Protocol):
 4. 进程内嵌也可直接 `HostService(root, binding_id, token, driver=MyDriver())`。
 5. 兼容说明：`bind` 配置仍要求存在 `notifier_path`（旧 CLI/适配器兼容）。不使用它的 driver 可以忽略该字段，但配置校验不会省略它。
 
-## 7. Pi 子端扩展工具
+### 6.1 OMP 父端驱动（session_bridge_file）
+
+`agent_link.hosts.omp:OmpHost` 把每条通知追加为一行 JSON 事件到 `<root>/omp-bridge/<binding_id>.jsonl`（flock 独占 + fsync，0600）；父端 OMP 主会话加载 `extensions/omp/agent-link.ts` 轮询该文件并注入会话：
+
+```bash
+python3 -m agent_link.host --root /abs/runtime --binding live-001 \
+  --credentials /abs/runtime/child-credentials.json \
+  --driver agent_link.hosts.omp:OmpHost
+
+AGENT_LINK_BRIDGE_FILE=/abs/runtime/omp-bridge/live-001.jsonl \
+AGENT_LINK_BINDING=live-001 \
+  omp --no-extensions --extension /abs/repo/extensions/omp/agent-link.ts
+```
+
+- 桥文件旁有两个由扩展管理的派生文件：`<bridge>.lock`（单消费者锁，内容 `pid:uuid`；持有进程死亡后由下一个会话回收一次，存活则拒绝成为第二消费者）与 `<bridge>.cursor`（`{offset, dev, ino}`，逐条原子推进，重启后从断点继续并识别追加/替换/截断）。
+- 事件字段：`v`(=1)、`ts`(UTC ISO8601 毫秒)、`source`(`service`|`notifier`)、`binding_id`、`thread_id`(父会话 id)、`kind`、`message_id`、`prompt`；ask 事件另有 `request_id`。
+- 扩展每秒轮询；只注入通过校验的事件（`v==1`、`binding_id` 匹配、`prompt` 非空），以 `deliverAs:"aside"`、`attribution:"agent"` 注入后推进 cursor。JSON 非法、结构非法、binding 不匹配或单行超过 1 MiB 的事件记日志跳过，不阻塞后续事件；**注入失败的事件会保序阻塞其后所有事件**，直到重试成功。
+- 写入失败（如桥目录位置被占用）由驱动抛 `DeliveryFailure`，服务记为 `failed_or_unknown`，不会产生半个事件。
+- 投递为 at-least-once：cursor 落盘前崩溃、或桥文件被整体替换时，已注入事件可能重放；不承诺 exactly-once。
+
+不使用宿主服务时，旧 CLI 也可经 notifier 兼容桥投递同一格式：`notifier_path` 指向 `agent_link/hosts/omp_notifier.py`，运行 CLI 的父端环境必须设置 `AGENT_LINK_BRIDGE_FILE` 与 `AGENT_LINK_BINDING`（缺失则投递失败，CLI exit 7）；`payload.thread_id` 必须是非空字符串。
+
+## 7. 子端扩展工具（Pi / OMP）
 
 `extensions/pi/agent-link.ts` 在 Pi 中注册三个模型可调用工具（`Type` 来自 `@earendil-works/pi-ai`，`defineTool`/`ExtensionAPI` 来自 `@earendil-works/pi-coding-agent`）：
 
@@ -199,6 +221,7 @@ class HostDriver(Protocol):
 - 凭据来自 `AGENT_LINK_CREDENTIALS` 指向的 JSON 文件，每次调用重新读取；非 loopback/未知协议/无效 token 直接报错，不发请求。
 - 客户端超时：默认 30s；ask 为服务端 timeout + 15s 余量。abort/超时不会取消服务端等待，也不会删除请求；应以相同 ID 查询或重放。
 - 加载方式（启动步骤见 §2.2）：命令行 `--extension` 显式加载，或放入项目/用户扩展目录；不会自动读取任何父端配置或会话 ID。
+- OMP：`extensions/omp/agent-link.ts` 注册同名三工具（`pi.zod` schema，带 `loadMode:"essential"`），工具名、文案与语义与 Pi 版逐字一致；加载方式 `omp --no-extensions --extension <repo>/extensions/omp/agent-link.ts`（显式 `-e` 在 `--no-extensions` 下仍生效）。同一文件在设置了 `AGENT_LINK_BRIDGE_FILE` + `AGENT_LINK_BINDING` 的父端主会话中还充当桥 watcher（1s 轮询、`deliverAs:"aside"`、`attribution:"agent"`，见 §6.1）；子端工具调用仍只依赖 `AGENT_LINK_CREDENTIALS`。
 
 ## 8. 测试与已验证 / 未验证
 
@@ -216,6 +239,8 @@ PI_CODING_AGENT_ROOT=<pi 包根> node tests/pi/extension_unit.test.mjs
 - `tests/test_host.py`：认证/**未知字段**/方法/路径 JSON 错误、body 限制、超时上限、**并发同消息单次投递**、驱动失败不重投、跨 binding 隔离、**服务重启重放不重投**、请求体读超时 408、凭据不覆盖/只删自己的。
 - `tests/test_pi_extension.py`：jiti 加载真实扩展 + fake `ExtensionAPI`；真实 `agent_link.host` + notifier stub（走旧 CLI `reply`）闭环：report/ask/get-request、超时后迟到答复、重启重放；`pi --help` 用探针扩展验证 Pi 真实加载扩展（无模型、无会话）。
 - `tests/pi/extension_unit.test.mjs`：工具注册、凭据校验、HTTP 错误、timeout 结果、abort。
+- `tests/test_omp_host.py`：OmpHost capabilities 与桥事件 schema、服务闭环（report 幂等不重发、ask 经 CLI `reply` 闭环）、`<root>/omp-bridge` 写失败记 `failed_or_unknown`、`omp_notifier.py` 旧 CLI 路径与缺环境变量失败。
+- `tests/test_omp_extension.py`（驱动脚本 `tests/omp/tool_loop.mjs`）：Bun 加载真实扩展对真实 `agent_link.host` + OmpHost 闭环；父端桥验收（重启恢复、注入失败保序阻塞、第二消费者拒绝与陈旧锁回收、会话切换换锁、文件替换/截断从零重放、超长与非法事件跳过）；真实 `omp --mode rpc` 的 `dumpTools` 注册三个工具（无模型）。
 
-已验证：上述 loopback 闭环、Pi 扩展注册与调用、旧 CLI 全量测试。
-未验证/不承诺：真实桌面新服务的通知投递（本轮避免与父任务冲突，未发真实桌面消息）、LLM 端到端工具调用（只验证了扩展加载与工具执行，不声称完整模型端测）、跨机器/MCP/Intercom、恶意同用户隔离、应用重启后的通知可靠性、exactly-once 投递。
+已验证：上述 loopback 闭环、Pi 扩展注册与调用、OMP 扩展在真实 OMP 18.11.1 下的加载与工具注册（`dumpTools` 列表）、OMP 父端桥六组验收（全部无模型）、旧 CLI 全量测试。
+未验证/不承诺：真实桌面新服务的通知投递（本轮避免与父任务冲突，未发真实桌面消息）、OMP 会话的真实注入效果与 `aside` 在忙碌/空闲会话的具体行为（`aside` 语义依据上游 extensions.md（main），未对本机 OMP 18.11.1 逐条验证）、LLM 端到端工具调用（只验证了扩展加载与工具执行，不声称完整模型端测）、跨机器/MCP/Intercom、恶意同用户隔离、应用重启后的通知可靠性、exactly-once 投递。

@@ -52,6 +52,7 @@ get_request(binding, request_id) 返回持久化状态和答复。
 
 当前 Codex 适配：notification_transport=desktop_bridge；receive_mode=host_injection；busy_behavior=unknown；wake_after_turn=unknown。
 当前 Pi 适配：reply_mode=blocking_tool_file_poll；spawn=false；cancel=false。
+当前 OMP 适配：notification_transport=session_bridge_file；receive_mode=session_injection；reply_mode=blocking_tool_file_poll；spawn=false；cancel=false（busy_behavior/wake_after_turn=unknown）。
 这些值描述本适配方式，不代表框架全部原生能力。
 
 ## 7. v0.1 CLI 契约
@@ -79,4 +80,4 @@ bind 配置 JSON：binding_id、run_id、native_task_id、parent={framework,sess
 
 ## 10. 已知限制
 
-单机可信 OS 用户、桌面消息管道需存活、文件轮询有延迟；不承诺应用重启后通知可用、不实现 exactly-once 外部投递。MCP/Intercom/OpenCode/OMP/zcode 适配和恢复策略留待后续版本。
+单机可信 OS 用户、桌面消息管道需存活、文件轮询有延迟；不承诺应用重启后通知可用、不实现 exactly-once 外部投递。MCP/Intercom/OpenCode/zcode 适配和恢复策略留待后续版本。

@@ -5,16 +5,16 @@
 - Python 标准库实现，无第三方运行依赖。
 - SQLite 单文件持久化，支持多个 CLI 进程并发。
 - 粘性绑定与消息幂等：绑定不可重定向，重复提交不重复投递，冲突显式报错。
-- 可选父端宿主服务 + 子端 Pi 原生工具：父端用旧 CLI 数据库，子端只持 loopback endpoint/token。
-- 当前已验证组合：Codex 桌面父端 + Pi CLI 子端（同机、同一 OS 用户，Linux/WSL）。
+- 可选父端宿主服务 + 子端 Pi/OMP 原生工具：父端用旧 CLI 数据库，子端只持 loopback endpoint/token。
+- 当前已验证组合：Codex 桌面父端 + Pi CLI 子端；OMP 父/子适配（含桥文件通知与轮询注入）已完成无模型验收（同机、同一 OS 用户，Linux/WSL）。
 
 ## 状态
 
-v0.1，仓库内 46 个测试全部通过（`python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v`）。
+v0.1，仓库内 58 个测试全部通过（`python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v`）。
 
-已验证：绑定/幂等/冲突、运行中 `report`、阻塞 `ask` 与父端 `reply` 反向回复、超时与迟到答复、数据库重开恢复、并发写入冲突、通知失败不重投；以及宿主服务 loopback 协议（超时上限、body/连接限制、统一 JSON 错误、并发/失败/跨 binding/未知字段、重启重放不重投）与 Pi 扩展（jiti 加载真实扩展、伪造 ExtensionAPI、真实 HTTP + 模拟父端闭环、`pi --help` 无模型加载验证）。
+已验证：绑定/幂等/冲突、运行中 `report`、阻塞 `ask` 与父端 `reply` 反向回复、超时与迟到答复、数据库重开恢复、并发写入冲突、通知失败不重投；宿主服务 loopback 协议（超时上限、body/连接限制、统一 JSON 错误、并发/失败/跨 binding/未知字段、重启重放不重投）；Pi 扩展（jiti 加载真实扩展、伪造 ExtensionAPI、真实 HTTP + 模拟父端闭环、`pi --help` 无模型加载验证）；OMP 父/子两条路径（Bun 加载真实扩展、对真实 OmpHost 服务闭环、父端桥六组无模型验收、真实 `omp --mode rpc` 注册三工具、`omp_notifier.py` 兼容桥）。
 
-仍为未知：父端忙碌时排队、父轮次结束后的唤醒、应用重启后的可靠性、exactly-once 外部投递、新宿主服务的真实桌面通知与 LLM 端到端工具调用。未适配其他宿主；不要只修改 `framework` 字符串就声称新框架受支持。
+仍为未知：父端忙碌时排队、父轮次结束后的唤醒、应用重启后的可靠性、exactly-once 外部投递、新宿主服务的真实桌面通知与 LLM 端到端工具调用、OMP 会话的真实注入效果（`aside` 语义未对本机 OMP 版本逐条验证）。不要只修改 `framework` 字符串就声称新框架受支持。
 
 ## 项目结构
 
@@ -22,18 +22,24 @@ v0.1，仓库内 46 个测试全部通过（`python3 -W error::ResourceWarning -
 agent_link/          # Python 包：CLI、SQLite 状态机、通知适配器、宿主服务与 HostDriver
   host.py            # 父端 binding 级 loopback 服务（python3 -m agent_link.host）
   hosts/codex.py     # Codex 桌面驱动；真实依赖 background-tasks 桌面桥
+  hosts/omp.py       # OMP 驱动：通知追加到 <root>/omp-bridge/<binding>.jsonl
+  hosts/omp_notifier.py  # 旧 CLI notifier 兼容桥（需 AGENT_LINK_BRIDGE_FILE/BINDING）
   adapter.py         # v0.1 兼容导入
-extensions/pi/agent-link.ts              # Pi 子端原生工具（report_parent/ask_parent/check_parent_request）
+extensions/
+  shared/agent-link-client.ts            # Pi/OMP 共用的子端 HTTP 客户端
+  pi/agent-link.ts                       # Pi 子端原生工具（report_parent/ask_parent/check_parent_request）
+  omp/agent-link.ts                      # OMP 子端工具 + 父端桥 watcher（1s 轮询注入）
 tests/               # unittest 测试（模拟 notifier/driver，不发真实桌面消息）
   pi/                # Node/jiti 扩展测试与真实 HTTP 闭环驱动脚本
+  omp/               # Bun 扩展测试 harness 与桥验收驱动脚本
 skills/agent-link/   # 宿主 skill 定义 + 可从任意 cwd 调用 CLI 的 link.py
 docs/
-  HOST-PROTOCOL.md   # 宿主服务 HTTP 协议、HostDriver 扩展方式、Pi --extension 用法
+  HOST-PROTOCOL.md   # 宿主服务 HTTP 协议、HostDriver 扩展方式、Pi/OMP --extension 用法
   BACKGROUND.md      # 上游研究与最初交接记录（背景资料）
   history/           # 实施、父端复审与边界修复历史
   experiments/       # 去敏后的通知/汇报/反向回复实测记录
 SPEC.md              # Agent Link 薄层规范 v0.1
-USAGE.md             # CLI 用法、状态模型、退出码、宿主服务启动
+USAGE.md             # CLI 用法、状态模型、退出码、宿主服务与 OMP 启动
 ```
 
 `experiments/`、`runtime/` 与根目录运行日志是本机数据，已由 `.gitignore` 排除：原始日志、SQLite 数据库和含聊天信息的运行产物不提交、不发布。
@@ -117,7 +123,7 @@ python3 -m pip install -e . --no-deps   # 开发模式
 
 - [SPEC.md](SPEC.md)：接口、能力声明、持久化与失败语义。
 - [USAGE.md](USAGE.md)：CLI 用法、状态模型、幂等规则、宿主服务启动与已知限制。
-- [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md)：宿主服务 HTTP 协议、HostDriver 扩展、Pi `--extension` 用法与未验证项。
+- [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md)：宿主服务 HTTP 协议、HostDriver 扩展、Pi/OMP `--extension` 用法与未验证项。
 - [docs/history/IMPLEMENTATION-RESULT.md](docs/history/IMPLEMENTATION-RESULT.md)：实现与真实反向回复验收记录（去敏版）。
 - [docs/history/REVIEW-FIXES.md](docs/history/REVIEW-FIXES.md)：父端独立复现的四项边界缺陷与回归要求。
 - [docs/experiments/notification-smoke/](docs/experiments/notification-smoke/)：三轮通信实测记录（去敏版）。

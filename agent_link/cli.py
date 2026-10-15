@@ -38,6 +38,15 @@ CAPABILITIES = {
             "spawn": False,
             "cancel": False,
         },
+        "omp": {
+            "notification_transport": "session_bridge_file",
+            "receive_mode": "session_injection",
+            "reply_mode": "blocking_tool_file_poll",
+            "busy_behavior": "unknown",
+            "wake_after_turn": "unknown",
+            "spawn": False,
+            "cancel": False,
+        },
     },
 }
 
