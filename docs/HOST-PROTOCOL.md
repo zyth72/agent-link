@@ -136,6 +136,12 @@ AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
 
 ## 5. Codex 驱动的真实依赖
 
+推荐使用独立的 [codex-background-tasks](https://github.com/zyth72/codex-background-tasks#安装)（MIT）作为 Codex 后台运行适配。先安装并重载工具，再由 `run_cli` 在父聊天环境中启动宿主服务和 Pi 子任务；明确传入绝对 cwd，保留返回的 task_id 用于查询、取消与面板查看。
+
+宿主服务是长驻进程，与 Pi 子任务分开管理：服务设置覆盖任务时长的超时，使用 `notify=false`；确认凭据文件已生成后，再用另一个 `run_cli` 启动 Pi（`notify=true`，传入 `AGENT_LINK_CREDENTIALS`）。Pi 退出不自动结束服务，所有相关子任务结束后取消服务任务。不要把宿主服务也启用完成通知而混淆两种结果。
+
+运行器不是通用宿主协议的强制依赖：其他框架可使用原生后台任务机制。当前 Codex 驱动对通知桥的依赖与上述运行器分工独立。
+
 默认 `agent_link.hosts.codex:CodexHost`：
 
 - 只加载 binding 中记录的 `notifier_path`（bind 时固定、校验存在），调用其 `bridge(payload)`；消息内容只作为数据。

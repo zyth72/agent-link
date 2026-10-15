@@ -38,6 +38,14 @@ USAGE.md             # CLI 用法、状态模型、退出码、宿主服务启�
 
 `experiments/`、`runtime/` 与根目录运行日志是本机数据，已由 `.gitignore` 排除：原始日志、SQLite 数据库和含聊天信息的运行产物不提交、不发布。
 
+## Codex 推荐配套：background-tasks
+
+Codex 桌面 + WSL 推荐先安装独立项目 [codex-background-tasks](https://github.com/zyth72/codex-background-tasks#安装)（MIT）。它提供后台启动、查询、取消、超时、完成通知和任务面板；Agent Link 提供运行中汇报、提问与回复。当前 Codex 宿主驱动还复用它的 `notifier.py` 桌面桥，Pi 子端不需要安装这个插件。
+
+安装方式、Python 版本与桌面限制以配套仓库说明为准。安装后重新加载 Codex，确认 `run_cli` 可用，再继续下面的绑定与宿主设置。绑定的 `notifier_path` 使用当前安装中的实际路径，不复制其他电脑的用户名或缓存版本。
+
+在 Codex 中可以说：“使用 agent-link，通过 background-tasks 启动 Pi，过程中汇报，需要决定时向父 agent 提问。”
+
 ## 快速开始
 
 ```bash

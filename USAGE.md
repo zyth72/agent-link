@@ -157,3 +157,7 @@ python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v
 - 墙钟回拨可能影响迟到判定；已记录 `wall_clock_jump_observed` 审计事件，但无法消除该限制。
 - 不实现 spawn/cancel；不绑定未启动的任务；不实现自动清理。
 - 本轮未用新宿主服务发送真实桌面通知，也未做 LLM 端到端工具调用（只验证扩展真实加载与工具执行）。
+
+## Codex 后台运行配套
+
+推荐先安装 [codex-background-tasks](https://github.com/zyth72/codex-background-tasks#安装)（MIT），重载后使用 `run_cli` 启动宿主和 Pi。宿主服务单独运行、`notify=false`；Pi 任务 `notify=true`，继承父环境并设置子端凭据路径。等待服务凭据就绪再启动 Pi，结束后关闭服务。完整生命周期见 [宿主规范](docs/HOST-PROTOCOL.md#5-codex-驱动的真实依赖)。
