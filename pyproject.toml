@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-link"
+dynamic = ["version"]
+description = "Thin cross-framework binding, progress-report and decision-request layer for parent/child agents"
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["agents", "intercom", "task-binding", "orchestration", "cli"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = []
+
+[project.scripts]
+agent-link = "agent_link.cli:main"
+
+[tool.setuptools]
+packages = ["agent_link"]
+
+[tool.setuptools.dynamic]
+version = {attr = "agent_link.__version__"}
