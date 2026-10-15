@@ -242,5 +242,14 @@ PI_CODING_AGENT_ROOT=<pi 包根> node tests/pi/extension_unit.test.mjs
 - `tests/test_omp_host.py`：OmpHost capabilities 与桥事件 schema、服务闭环（report 幂等不重发、ask 经 CLI `reply` 闭环）、`<root>/omp-bridge` 写失败记 `failed_or_unknown`、`omp_notifier.py` 旧 CLI 路径与缺环境变量失败。
 - `tests/test_omp_extension.py`（驱动脚本 `tests/omp/tool_loop.mjs`）：Bun 加载真实扩展对真实 `agent_link.host` + OmpHost 闭环；父端桥验收（重启恢复、注入失败保序阻塞、第二消费者拒绝与陈旧锁回收、会话切换换锁、文件替换/截断从零重放、超长与非法事件跳过）；真实 `omp --mode rpc` 的 `dumpTools` 注册三个工具（无模型）。
 
-已验证：上述 loopback 闭环、Pi 扩展注册与调用、OMP 扩展在真实 OMP 18.11.1 下的加载与工具注册（`dumpTools` 列表）、OMP 父端桥六组验收（全部无模型）、旧 CLI 全量测试。
-未验证/不承诺：真实桌面新服务的通知投递（本轮避免与父任务冲突，未发真实桌面消息）、OMP 会话的真实注入效果与 `aside` 在忙碌/空闲会话的具体行为（`aside` 语义依据上游 extensions.md（main），未对本机 OMP 18.11.1 逐条验证）、LLM 端到端工具调用（只验证了扩展加载与工具执行，不声称完整模型端测）、跨机器/MCP/Intercom、恶意同用户隔离、应用重启后的通知可靠性、exactly-once 投递。
+已验证：上述 loopback 闭环、Pi 扩展注册与调用、OMP 扩展在真实 OMP 18.11.1 下的加载与工具注册（`dumpTools` 列表）、OMP 父端桥六组验收（全部无模型）、真实 OMP 会话注入实测（`--mode rpc` 空闲会话收到桥事件后启动一轮，模型实际回答 `bridge-ok`；`.lock` 由真实 1s 轮询持有与释放，`.cursor.offset` 推进到文件大小）、旧 CLI 全量测试。
+未验证/不承诺：真实桌面新服务的通知投递（本轮避免与父任务冲突，未发真实桌面消息）、OMP 忙碌会话（轮次进行中）的注入行为与父轮次结束后的唤醒（空闲会话 `aside` 启动一轮已实测；其余语义依据上游 extensions.md（main））、LLM 端到端工具调用（模型实际调用三个工具，只验证了扩展加载、工具执行与注入后的一轮回答）、跨机器/MCP/Intercom、恶意同用户隔离、应用重启后的通知可靠性、exactly-once 投递。
+
+如需复查真实会话注入（会调用一次当前配置的模型，仅手动执行，不属于默认测试）：
+
+```bash
+AGENT_LINK_BRIDGE_FILE=/abs/runtime/omp-bridge/live-001.jsonl AGENT_LINK_BINDING=live-001 \
+  omp --mode rpc --no-ui --no-extensions -e /abs/repo/extensions/omp/agent-link.ts
+# 再向桥文件追加一行 {"v":1,"binding_id":"live-001","prompt":"..."}：
+# <bridge>.lock 出现、<bridge>.cursor.offset 推进到文件大小，rpc stdout 出现 turn_start 与模型回答。
+```

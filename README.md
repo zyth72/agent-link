@@ -12,9 +12,9 @@
 
 v0.1，仓库内 58 个测试全部通过（`python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v`）。
 
-已验证：绑定/幂等/冲突、运行中 `report`、阻塞 `ask` 与父端 `reply` 反向回复、超时与迟到答复、数据库重开恢复、并发写入冲突、通知失败不重投；宿主服务 loopback 协议（超时上限、body/连接限制、统一 JSON 错误、并发/失败/跨 binding/未知字段、重启重放不重投）；Pi 扩展（jiti 加载真实扩展、伪造 ExtensionAPI、真实 HTTP + 模拟父端闭环、`pi --help` 无模型加载验证）；OMP 父/子两条路径（Bun 加载真实扩展、对真实 OmpHost 服务闭环、父端桥六组无模型验收、真实 `omp --mode rpc` 注册三工具、`omp_notifier.py` 兼容桥）。
+已验证：绑定/幂等/冲突、运行中 `report`、阻塞 `ask` 与父端 `reply` 反向回复、超时与迟到答复、数据库重开恢复、并发写入冲突、通知失败不重投；宿主服务 loopback 协议（超时上限、body/连接限制、统一 JSON 错误、并发/失败/跨 binding/未知字段、重启重放不重投）；Pi 扩展（jiti 加载真实扩展、伪造 ExtensionAPI、真实 HTTP + 模拟父端闭环、`pi --help` 无模型加载验证）；OMP 父/子两条路径（Bun 加载真实扩展、对真实 OmpHost 服务闭环、父端桥六组无模型验收、真实 `omp --mode rpc` 注册三工具、`omp_notifier.py` 兼容桥、真实会话注入实测：空闲会话收到桥事件后启动一轮并由模型实际回答）。
 
-仍为未知：父端忙碌时排队、父轮次结束后的唤醒、应用重启后的可靠性、exactly-once 外部投递、新宿主服务的真实桌面通知与 LLM 端到端工具调用、OMP 会话的真实注入效果（`aside` 语义未对本机 OMP 版本逐条验证）。不要只修改 `framework` 字符串就声称新框架受支持。
+仍为未知：父端忙碌时排队、父轮次结束后的唤醒、应用重启后的可靠性、exactly-once 外部投递、新宿主服务的真实桌面通知、LLM 端到端工具调用（模型实际调用 agent-link 工具）、OMP 忙碌会话的注入行为。不要只修改 `framework` 字符串就声称新框架受支持。
 
 ## 项目结构
 
