@@ -61,6 +61,9 @@ export async function loadExtension() {
 
 export function fakePi() {
   const tools = new Map();
+  const lifecycle = new Map();
+  const sent = [];
+  const logs = [];
   const pi = {
     registerTool(tool) {
       if (!tool || typeof tool.name !== "string" || typeof tool.execute !== "function") {
@@ -69,6 +72,60 @@ export function fakePi() {
       tools.set(tool.name, tool);
       return tool;
     },
+    on(event, handler) {
+      if (!lifecycle.has(event)) lifecycle.set(event, []);
+      lifecycle.get(event).push(handler);
+    },
+    sendUserMessage(text, options) {
+      // Test hook: while `pi.failOn` is a non-empty string contained in the
+      // text, the injection throws exactly once (the marker is consumed).
+      if (pi.failOn && String(text).includes(pi.failOn)) {
+        pi.failOn = null;
+        throw new Error("simulated injection failure");
+      }
+      sent.push({ text: String(text), options });
+    },
+    failOn: null,
+    logger: {
+      error(message) {
+        logs.push(String(message));
+      },
+    },
   };
-  return { pi, tools };
+  return { pi, tools, lifecycle, sent, logs };
+}
+
+/** Minimal ExtensionContext stand-in for the parent bridge watcher. */
+export function makePiCtx(options = {}) {
+  const notifies = [];
+  const ctx = {
+    isIdle: options.isIdle ?? (() => true),
+    ui: {
+      notify(message, level) {
+        notifies.push({ message: String(message), level: String(level) });
+      },
+    },
+    sessionManager: { getSessionId: () => options.sessionId ?? "pi-session" },
+  };
+  return { ctx, notifies };
+}
+
+export async function fireLifecycle(lifecycle, event, ctx) {
+  for (const handler of lifecycle.get(event) ?? []) {
+    await handler({}, ctx);
+  }
+}
+
+export function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function waitFor(condition, { timeoutMs = 8000, intervalMs = 25 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await condition()) return;
+    await sleep(intervalMs);
+  }
+  if (await condition()) return;
+  throw new Error("waitFor timed out");
 }

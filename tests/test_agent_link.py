@@ -19,6 +19,7 @@ from unittest import mock
 
 from agent_link.errors import ConflictError, ValidationError
 from agent_link.storage import Store
+from tests import isolate_registry
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI = [sys.executable, "-m", "agent_link"]
@@ -64,6 +65,7 @@ class CliCase(unittest.TestCase):
         self.stub = self.tmp / "stub_notifier.py"
         self.stub.write_text(STUB_SOURCE, encoding="utf-8")
         self.log = self.tmp / "notifier-calls.jsonl"
+        isolate_registry(self)
         self.env = base_env({"STUB_NOTIFIER_LOG": str(self.log), "STUB_NOTIFIER_FAIL": "0"})
 
     # -- helpers -------------------------------------------------------

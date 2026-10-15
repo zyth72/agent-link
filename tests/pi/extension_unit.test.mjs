@@ -10,16 +10,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { appendFile, mkdir, mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { loadExtension, fakePi } from "./harness.mjs";
+import { loadExtension, fakePi, makePiCtx, fireLifecycle, sleep, waitFor } from "./harness.mjs";
 
 const TOKEN = "unit-test-token-0123456789";
 const ORIGINAL_CREDENTIALS_ENV = process.env.AGENT_LINK_CREDENTIALS;
 
 const { factory } = await loadExtension();
-const { pi, tools } = fakePi();
+const { pi, tools, lifecycle, sent, logs } = fakePi();
 factory(pi);
 
 function respondJson(res, status, payload) {
@@ -233,4 +234,215 @@ test("an aborted ask points back to the same request id", async (t) => {
   setTimeout(() => controller.abort(), 50);
   await assert.rejects(promise, /did not finish/);
   await assert.rejects(promise, /same IDs|check the same IDs|persisted/);
+});
+
+// -- parent bridge watcher -------------------------------------------------
+
+const WATCHER_ENV = ["AGENT_LINK_BRIDGE_FILE", "AGENT_LINK_BINDING", "AGENT_LINK_REGISTRY"];
+
+/** Pin the watcher env for one test and restore the process env afterwards. */
+function setWatcherEnv(t, vars) {
+  const saved = {};
+  for (const key of WATCHER_ENV) {
+    saved[key] = process.env[key];
+    if (key in vars) process.env[key] = vars[key];
+    else delete process.env[key];
+  }
+  t.after(() => {
+    for (const key of WATCHER_ENV) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+}
+
+function eventLine({ binding, threadId = "parent", kind = "report", messageId, prompt }) {
+  return (
+    JSON.stringify({
+      v: 1,
+      ts: "2026-01-01T00:00:00.000Z",
+      source: "service",
+      binding_id: binding,
+      thread_id: threadId,
+      kind,
+      message_id: messageId,
+      prompt,
+    }) + "\n"
+  );
+}
+
+async function writeRegistryEntry(
+  dir,
+  { binding, root, framework = "pi", sessionId, updatedAt = "2026-01-01T00:00:00.000Z" },
+) {
+  await writeFile(
+    path.join(dir, `${binding}.json`),
+    JSON.stringify({
+      version: 1,
+      binding_id: binding,
+      run_id: `r-${binding}`,
+      native_task_id: null,
+      root,
+      parent: { framework, session_id: sessionId },
+      child: { framework: "pi", session_id: "child" },
+      config_digest: "d".repeat(64),
+      created_at: updatedAt,
+      updated_at: updatedAt,
+    }),
+  );
+}
+
+/** Stop the watcher and wait until the bridge lock is actually released. */
+async function shutdownWatcher(ctx, bridgeFile) {
+  await fireLifecycle(lifecycle, "session_shutdown", ctx);
+  await waitFor(() => !existsSync(bridgeFile + ".lock"));
+}
+
+test("watcher: env bridge injects events (idle plain, busy followUp)", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "agent-link-pi-watch-env-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const binding = "pi-env-b";
+  const bridgeFile = path.join(dir, "omp-bridge", `${binding}.jsonl`);
+  await mkdir(path.dirname(bridgeFile), { recursive: true });
+  await writeFile(
+    bridgeFile,
+    eventLine({ binding, messageId: "m-1", prompt: "env-prompt-A" }),
+  );
+  setWatcherEnv(t, { AGENT_LINK_BRIDGE_FILE: bridgeFile, AGENT_LINK_BINDING: binding });
+  const base = sent.length;
+  let idle = true;
+  const { ctx, notifies } = makePiCtx({ isIdle: () => idle });
+  await fireLifecycle(lifecycle, "session_start", ctx);
+  await waitFor(() => sent.length > base);
+  assert.equal(sent[base].text, "env-prompt-A");
+  assert.equal(sent[base].options, undefined, "an idle session gets a plain injection");
+  idle = false;
+  await appendFile(bridgeFile, eventLine({ binding, messageId: "m-2", prompt: "env-prompt-B" }));
+  await waitFor(() => sent.length > base + 1);
+  assert.equal(sent[base + 1].text, "env-prompt-B");
+  assert.deepEqual(
+    sent[base + 1].options,
+    { deliverAs: "followUp" },
+    "a busy session queues the event instead of interrupting",
+  );
+  assert.ok(notifies.length >= 2, "each injection is notified");
+  await shutdownWatcher(ctx, bridgeFile);
+});
+
+test("watcher: auto-claim matches this session and pins thread_id", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "agent-link-pi-watch-claim-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const registry = path.join(dir, "registry");
+  const root = path.join(dir, "root");
+  const binding = "pi-auto-b";
+  const bridgeFile = path.join(root, "omp-bridge", `${binding}.jsonl`);
+  await mkdir(registry, { recursive: true });
+  await mkdir(path.dirname(bridgeFile), { recursive: true });
+  const sessionId = "pi-auto";
+  await writeRegistryEntry(registry, { binding, root, sessionId });
+  await writeFile(
+    bridgeFile,
+    eventLine({ binding, threadId: "not-me", messageId: "m-x", prompt: "auto-wrong" }) +
+      eventLine({ binding, threadId: sessionId, messageId: "m-y", prompt: "auto-ok" }),
+  );
+  setWatcherEnv(t, { AGENT_LINK_REGISTRY: registry });
+  const base = sent.length;
+  const { ctx } = makePiCtx({ sessionId });
+  await fireLifecycle(lifecycle, "session_start", ctx);
+  await waitFor(() => sent.length > base);
+  assert.deepEqual(sent.slice(base).map((entry) => entry.text), ["auto-ok"]);
+  assert.ok(
+    logs.some((line) => line.includes("skipping invalid event")),
+    `foreign thread_id is skipped: ${logs}`,
+  );
+  await shutdownWatcher(ctx, bridgeFile);
+});
+
+test("watcher: auto-claim ignores other sessions and other frameworks", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "agent-link-pi-watch-mismatch-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const registry = path.join(dir, "registry");
+  await mkdir(registry, { recursive: true });
+  await writeRegistryEntry(registry, {
+    binding: "pi-other-b",
+    root: path.join(dir, "root-a"),
+    sessionId: "someone-else",
+  });
+  await writeRegistryEntry(registry, {
+    binding: "pi-omp-b",
+    root: path.join(dir, "root-b"),
+    framework: "omp",
+    sessionId: "pi-mismatch",
+  });
+  setWatcherEnv(t, { AGENT_LINK_REGISTRY: registry });
+  const base = sent.length;
+  const logsBase = logs.length;
+  const { ctx } = makePiCtx({ sessionId: "pi-mismatch" });
+  await fireLifecycle(lifecycle, "session_start", ctx);
+  await sleep(1200); // the immediate claim attempt runs; nothing may attach
+  assert.equal(sent.length, base, "no event may be injected");
+  assert.equal(logs.length, logsBase, `no watcher errors expected: ${logs.slice(logsBase)}`);
+  assert.ok(
+    !existsSync(path.join(dir, "root-a", "omp-bridge", "pi-other-b.jsonl.lock")) &&
+      !existsSync(path.join(dir, "root-b", "omp-bridge", "pi-omp-b.jsonl.lock")),
+    "no bridge lock may be taken",
+  );
+  await fireLifecycle(lifecycle, "session_shutdown", ctx);
+});
+
+test("watcher: auto-claim discovers a binding registered after session start", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "agent-link-pi-watch-late-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const registry = path.join(dir, "registry");
+  const root = path.join(dir, "root");
+  const binding = "pi-late-b";
+  const bridgeFile = path.join(root, "omp-bridge", `${binding}.jsonl`);
+  await mkdir(registry, { recursive: true });
+  await mkdir(path.dirname(bridgeFile), { recursive: true });
+  const sessionId = "pi-late";
+  setWatcherEnv(t, { AGENT_LINK_REGISTRY: registry });
+  const base = sent.length;
+  const { ctx } = makePiCtx({ sessionId });
+  await fireLifecycle(lifecycle, "session_start", ctx);
+  await sleep(300); // no claim exists yet; the rescan timer is pending
+  assert.equal(sent.length, base);
+  await writeRegistryEntry(registry, { binding, root, sessionId });
+  await writeFile(
+    bridgeFile,
+    eventLine({ binding, threadId: sessionId, messageId: "m-late", prompt: "late-1" }),
+  );
+  await waitFor(() => sent.length > base, { timeoutMs: 6000 });
+  assert.equal(sent[base].text, "late-1");
+  await shutdownWatcher(ctx, bridgeFile);
+});
+
+test("watcher: a failing injection blocks later events until it succeeds", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "agent-link-pi-watch-fail-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const binding = "pi-fail-b";
+  const bridgeFile = path.join(dir, "omp-bridge", `${binding}.jsonl`);
+  await mkdir(path.dirname(bridgeFile), { recursive: true });
+  await writeFile(
+    bridgeFile,
+    eventLine({ binding, messageId: "m-a", prompt: "event-A" }) +
+      eventLine({ binding, messageId: "m-b", prompt: "event-B" }) +
+      eventLine({ binding, messageId: "m-c", prompt: "event-C" }),
+  );
+  setWatcherEnv(t, { AGENT_LINK_BRIDGE_FILE: bridgeFile, AGENT_LINK_BINDING: binding });
+  const base = sent.length;
+  const logsBase = logs.length;
+  pi.failOn = "event-A";
+  const { ctx } = makePiCtx();
+  await fireLifecycle(lifecycle, "session_start", ctx);
+  await waitFor(() =>
+    logs.slice(logsBase).some((line) => line.includes("injection failed")),
+  );
+  assert.equal(sent.length, base, "the failing event blocks the ones behind it");
+  await waitFor(() => sent.length >= base + 3);
+  assert.deepEqual(
+    sent.slice(base).map((entry) => entry.text),
+    ["event-A", "event-B", "event-C"],
+    "after the retry the order is preserved",
+  );
+  await shutdownWatcher(ctx, bridgeFile);
 });

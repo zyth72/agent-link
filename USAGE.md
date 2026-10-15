@@ -43,6 +43,11 @@ python3 -m agent_link --root /abs/runtime get-request \
 | `ask ...` | 先持久化请求，再通知父端，然后阻塞等待答复 | 0 / 3 / 4 / 5 / 7 |
 | `reply ...` | 关联已存在请求写入答复；不允许覆盖 | 0 / 4 / 5 / 6 |
 | `get-request ...` | 返回请求状态与答复 | 0 / 5 / 6 |
+| `ask-child ...` | 父端请求子端答复并阻塞等待（写入子端 inbox `<root>/inbox/<binding>.jsonl`） | 0 / 3 / 4 / 5 / 6 / 7 |
+| `answer ...` | 子端答复父端请求；不允许覆盖 | 0 / 4 / 5 / 6 |
+| `get-parent-request ...` | 返回父端请求状态与答复 | 0 / 5 / 6 |
+| `list-parent-requests --binding ID [--pending]` | 列出父端请求 | 0 / 6 |
+| `list-bindings [--parent-session-id ID] [--child-session-id ID] [--parent-framework F] [--child-framework F]` | 列出用户级绑定索引条目（注册表）；`--root` 接受但不使用 | 0 |
 
 所有命令 `--root ABS_DIR` 放在子命令前；stdout 恰好一条 JSON 结果，诊断写 stderr；错误非零。
 
@@ -104,6 +109,8 @@ python3 -m agent_link --root /abs/runtime get-request \
 - `timed_out` 之后不允许再写入第二个不同的迟到答复（冲突）。
 - 请求、答复和审计事件（events 表）保留到显式人工清理，不自动删除。
 
+父端请求（`parent_requests`，父端 `ask-child` 发起、子端 `answer` 答复）语义与子端请求完全镜像：`pending -> answered | timed_out`，幂等/冲突/迟到答复（`late=true`）规则相同；父端请求的投递状态写在请求行上——子端 inbox 事件写入成功即 `host_accepted`，不代表子端已处理，是否处理由持久化的答复证明。
+
 ## 能力声明
 
 `capabilities` 输出本适配方式的声明，不推断框架全部原生能力：
@@ -159,6 +166,9 @@ AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
   omp --no-extensions --extension /abs/repo/extensions/omp/agent-link.ts '<任务>'
 ```
 
+- 扩展安装：把 `/abs/repo/extensions/omp/agent-link.ts` 登记进 `~/.omp/agent/config.yml` 的 `extensions:`（每个新会话自动加载）或每次 `--extension` 显式加载；扩展只在会话启动时加载，运行中无法补挂，且须保持 `extensions/` 目录完整（依赖 `shared/agent-link-client.ts`）。
+- 自动认领（推荐）：不设两个桥环境变量时，watcher 按本会话 id 从注册表（`~/.agent-link/registry/`，由 `bind` 与宿主服务写入）自动认领 binding——`parent.session_id` 匹配本会话则消费父桥，`child.session_id` 匹配则消费子端 inbox（可同时持有）；绑定在会话启动后创建也会被约 2s 的重扫发现。显式环境变量始终优先。
+- 父→子通道：父端 `ask-child` 写 `<root>/inbox/<binding>.jsonl` 唤醒子端；OMP 子端用 `answer_parent`/`poll_parent_requests` 工具答复（Pi 子端暂用 CLI `answer`）。
 - `<bridge>.lock`（单消费者锁）与 `<bridge>.cursor`（断点，含文件身份 dev/ino）由扩展自动维护：第二个消费者被拒绝，持有进程死亡后锁被回收一次，重启从断点续传并识别文件替换/截断。
 - 注入失败的事件保序阻塞其后事件直到重试成功；超长/非法事件记日志跳过；投递为 at-least-once，不承诺 exactly-once。
 - 不用宿主服务时，旧 CLI 路径把绑定里的 `notifier_path` 指向 `agent_link/hosts/omp_notifier.py`，并在运行 CLI 的环境设置两个变量（缺任一无则 exit 7，投递记 `failed_or_unknown`）：
@@ -168,6 +178,38 @@ AGENT_LINK_BRIDGE_FILE=/abs/runtime/omp-bridge/live-001.jsonl AGENT_LINK_BINDING
   python3 -m agent_link --root /abs/runtime report \
   --binding live-001 --message-id progress-001 --text "实现完成 60%"
 ```
+
+## OpenCode 父端/子端（可选）
+
+OpenCode 用 v2 插件 `extensions/opencode/agent-link.ts`（本机验证 2.0.29；v1 插件形态会被拒绝加载）：把文件放入 `~/.config/opencode/plugin/` 后每个会话自动加载。子端五个工具与 OMP 同名同语义；watcher 复用共享模块，同样支持注册表自动认领。父端宿主服务用 `--driver agent_link.hosts.opencode:OpenCodeHost`（文件桥与 OMP 相同）。已知限制（server 级多会话归属近似等）见 [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md) §7 与插件文件头注释。
+
+## Codex 父端助手（agent_link.codex，推荐）
+
+Codex 桌面父端不要把消息里的 `--root` 当作回复目标。新 helper 只用用户级注册表（`~/.agent-link/registry/`）发现绑定，并用 SQLite **只读模式**打开 root 下既有数据库，核对 parent 会话归属与 run_id/config_digest 等标识后才接受：
+
+```bash
+# 会话 id 显式传入，或使用聊天环境里的 CODEX_THREAD_ID / CODEX_SESSION_ID
+python3 -m agent_link.codex --session-id CURRENT_THREAD list
+
+# 多个 binding 必须显式 --binding（不会自动选最新）
+python3 -m agent_link.codex --session-id CURRENT_THREAD --binding BINDING \
+  reply --request-id R --message-id M --answer 'A'
+
+python3 -m agent_link.codex --session-id CURRENT_THREAD --binding BINDING \
+  ask-child --request-id R --message-id M --question Q --timeout 240
+python3 -m agent_link.codex --session-id CURRENT_THREAD --binding BINDING \
+  get-request --request-id R
+python3 -m agent_link.codex --session-id CURRENT_THREAD --binding BINDING \
+  list-parent-requests --pending
+```
+
+- 支持 `list`、`reply`、`ask-child`、`get-request`、`get-parent-request`、`list-parent-requests`；参数与核心 CLI 同名，复用同一 handler，JSON 与退出码不变。
+- **不接受 `--root`**；坏条目/缺 root/缺数据库在 `list` 中作为 `rejected` 带原因返回，不自动建库，也不会把消息里的 root 当成执行目标。
+- 仅当恰好一个候选通过校验时才能省略 `--binding`；多条匹配必须显式选择。
+- `ask-child` 阻塞；长等待放进 background-tasks 后台任务。能否唤醒子端取决于子端适配器（OMP/OpenCode 有 inbox watcher；Pi/Codex 子端暂无自动 inbox 注入）。
+- wrapper：`python3 /abs/repo/skills/agent-link/scripts/link.py --codex --session-id CURRENT_THREAD list` 可从任意 cwd 调用；独立安装副本用脚本旁的 `repo-location.json` 定位仓库。
+
+完整流程、校验规则与宿主服务启动步骤见 [docs/CODEX.md](docs/CODEX.md)。
 
 ## 测试
 
@@ -190,4 +232,4 @@ python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v
 
 ## Codex 后台运行配套
 
-推荐先安装 [codex-background-tasks](https://github.com/zyth72/codex-background-tasks#安装)（MIT），重载后使用 `run_cli` 启动宿主和 Pi。宿主服务单独运行、`notify=false`；Pi 任务 `notify=true`，继承父环境并设置子端凭据路径。等待服务凭据就绪再启动 Pi，结束后关闭服务。完整生命周期见 [宿主规范](docs/HOST-PROTOCOL.md#5-codex-驱动的真实依赖)。
+推荐先安装 [codex-background-tasks](https://github.com/zyth72/codex-background-tasks#安装)（MIT），重载后使用 `run_cli` 启动宿主和 Pi。父端发现、查询与回复推荐使用 `python3 -m agent_link.codex`（见 [docs/CODEX.md](docs/CODEX.md)），不要凭消息里的 root 直接 `reply`。宿主服务单独运行、`notify=false`；Pi 任务 `notify=true`，必须显式 `--extension /abs/repo/extensions/pi/agent-link.ts`，继承父环境并设置子端凭据路径。等待服务凭据就绪再启动 Pi，结束后关闭服务。完整生命周期见 [宿主规范](docs/HOST-PROTOCOL.md#5-codex-驱动的真实依赖)。

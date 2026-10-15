@@ -28,6 +28,8 @@ import unittest
 from pathlib import Path
 
 from agent_link.errors import AgentLinkError
+from agent_link.registry import entry_from_row, write_entry
+from tests import isolate_registry
 from agent_link.storage import Store
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +70,7 @@ class OmpChildE2ECase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        isolate_registry(self)
         self.base = Path(self.temp.name)
         self.root = self.base / "state"
         self.stub = self.base / "notifier_stub.py"
@@ -149,8 +152,22 @@ class OmpChildE2ECase(unittest.TestCase):
             "report_message_id": "omp-e2e-report-001",
             "request_id": "omp-e2e-request-001",
             "question_message_id": "omp-e2e-question-001",
+            "parent_request_id": "omp-e2e-parent-req-001",
+            "parent_answer_message_id": "omp-e2e-parent-answer-001",
         }
         host = self.start_host()
+        # A parent-initiated request is already pending before the child starts.
+        store = Store(self.root)
+        try:
+            store.prepare_parent_ask(
+                self.binding,
+                ids["parent_request_id"],
+                "omp-e2e-parent-msg-001",
+                "child, report back",
+                60.0,
+            )
+        finally:
+            store.close()
         child: dict = {}
 
         def run_child():
@@ -209,6 +226,20 @@ class OmpChildE2ECase(unittest.TestCase):
         self.assertIn("parent decision", happy["ask"]["text"])
         self.assertTrue(happy["check"]["ok"], happy["check"])
         self.assertEqual(happy["check"]["details"]["status"], "replied")
+        # Parent->child channel via the child tools: poll + answer.
+        self.assertTrue(happy["poll"]["ok"], happy["poll"])
+        polled = [row["request_id"] for row in happy["poll"]["details"]["parent_requests"]]
+        self.assertEqual(polled, [ids["parent_request_id"]])
+        self.assertTrue(happy["answer"]["ok"], happy["answer"])
+        self.assertEqual(happy["answer"]["details"]["status"], "answered")
+        store = Store(self.root)
+        try:
+            parent_row = store.get_parent_request(self.binding, ids["parent_request_id"])
+        finally:
+            store.close()
+        self.assertEqual(parent_row["status"], "answered")
+        self.assertEqual(parent_row["answer"], "child answer")
+        self.assertEqual(parent_row["answer_message_id"], ids["parent_answer_message_id"])
         events = [
             json.loads(line)
             for line in self.bridge_file.read_text(encoding="utf-8").splitlines()
@@ -230,8 +261,10 @@ class OmpBridgeCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        isolate_registry(self)
         self.base = Path(self.temp.name)
         self.bridge_file = self.base / "omp-bridge" / f"{self.binding}.jsonl"
+        self.inbox_file = self.base / "inbox" / f"{self.binding}.jsonl"
 
     # -- helpers -------------------------------------------------------
     def bridge_env(self, extra: dict | None = None) -> dict:
@@ -242,8 +275,16 @@ class OmpBridgeCase(unittest.TestCase):
         env.update(extra or {})
         return env
 
-    def write_events(self, prompts: list[str], binding: str | None = None) -> list[bytes]:
-        self.bridge_file.parent.mkdir(parents=True, exist_ok=True)
+    def write_events(
+        self,
+        prompts: list[str],
+        binding: str | None = None,
+        thread_id: str = "parent",
+        child_session_id: str = "child",
+        path: Path | None = None,
+    ) -> list[bytes]:
+        target = path or self.bridge_file
+        target.parent.mkdir(parents=True, exist_ok=True)
         lines = [
             json.dumps(
                 {
@@ -251,7 +292,8 @@ class OmpBridgeCase(unittest.TestCase):
                     "ts": "2026-01-01T00:00:00.000Z",
                     "source": "service",
                     "binding_id": self.binding if binding is None else binding,
-                    "thread_id": "parent",
+                    "thread_id": thread_id,
+                    "child_session_id": child_session_id,
                     "kind": "report",
                     "message_id": f"m-{index}",
                     "prompt": prompt,
@@ -260,7 +302,7 @@ class OmpBridgeCase(unittest.TestCase):
             + "\n"
             for index, prompt in enumerate(prompts, start=1)
         ]
-        with self.bridge_file.open("a", encoding="utf-8") as stream:
+        with target.open("a", encoding="utf-8") as stream:
             stream.write("".join(lines))
         return [line.encode("utf-8") for line in lines]
 
@@ -285,6 +327,149 @@ class OmpBridgeCase(unittest.TestCase):
         if not path.is_file():
             return None
         return json.loads(path.read_text(encoding="utf-8"))["offset"]
+
+    # -- auto-claim helpers (session-id discovery) -------------------------
+    def claim_env(
+        self, session_id: str, extra: dict | None = None, bridge_file: Path | None = None
+    ) -> dict:
+        env = dict(os.environ)
+        env.pop("AGENT_LINK_BRIDGE_FILE", None)
+        env.pop("AGENT_LINK_BINDING", None)
+        env.pop("AGENT_LINK_CREDENTIALS", None)
+        env["AGENT_LINK_TEST_BRIDGE_FILE"] = str(bridge_file or self.bridge_file)
+        env["AGENT_LINK_TEST_SESSION_ID"] = session_id
+        env.update(extra or {})
+        return env
+
+    def write_claim(self, binding: str, parent_session: str, child_session: str = "child") -> None:
+        write_entry(
+            entry_from_row(
+                self.base,
+                {
+                    "binding_id": binding,
+                    "run_id": "r-" + binding,
+                    "native_task_id": None,
+                    "parent_framework": "omp",
+                    "parent_session_id": parent_session,
+                    "child_framework": "omp",
+                    "child_session_id": child_session,
+                    "config_digest": "d" * 64,
+                },
+            )
+        )
+
+    def run_claim(
+        self, scenario: str, session_id: str, timeout: int = 180, bridge_file: Path | None = None
+    ) -> dict:
+        process = subprocess.run(
+            [BUN, str(TOOL_LOOP), scenario],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            env=self.claim_env(session_id, bridge_file=bridge_file),
+            timeout=timeout,
+        )
+        self.assertEqual(
+            process.returncode, 0, f"bun {scenario} failed:\n{process.stdout}\n{process.stderr}"
+        )
+        lines = [line for line in process.stdout.splitlines() if line.strip()]
+        self.assertTrue(lines, f"bun {scenario} printed nothing")
+        return json.loads(lines[-1])
+
+    # -- auto-claim tests -------------------------------------------------
+    @unittest.skipUnless(BUN_READY, "bun is required")
+    def test_auto_claim_matches_session_id(self):
+        session_id = "parent-auto"
+        self.write_claim("bridge-b", session_id)
+        self.write_events(["auto-1", "auto-2"], thread_id=session_id)
+        out = self.run_claim("bridge-auto-claim", session_id)
+        self.assertEqual([entry["text"] for entry in out["sent"]], ["auto-1", "auto-2"])
+        self.assertTrue(out["lockHeld"])
+        self.assertFalse(out["lockAfterShutdown"], "shutdown must release the lock")
+        self.assertEqual(out["cursor"]["offset"], self.bridge_file.stat().st_size)
+
+    @unittest.skipUnless(BUN_READY, "bun is required")
+    def test_auto_claim_ignores_other_parents_and_foreign_thread(self):
+        session_id = "parent-auto"
+        self.write_claim("other-b", "someone-else")
+        self.write_claim("bridge-b", session_id)
+        self.write_events(["auto-wrong"], thread_id="not-me")
+        self.write_events(["auto-ok"], thread_id=session_id)
+        out = self.run_claim("bridge-auto-claim", session_id)
+        self.assertEqual([entry["text"] for entry in out["sent"]], ["auto-ok"])
+        self.assertTrue(
+            any("skipping invalid event" in line for line in out["logs"]),
+            out["logs"],
+        )
+
+    @unittest.skipUnless(BUN_READY, "bun is required")
+    def test_auto_claim_discovers_late_binding(self):
+        session_id = "parent-auto"
+        process = subprocess.Popen(
+            [BUN, str(TOOL_LOOP), "bridge-auto-claim-late"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(REPO_ROOT),
+            env=self.claim_env(session_id),
+        )
+        try:
+            time.sleep(2.5)  # the harness is up while the registry is still empty
+            self.write_claim("bridge-b", session_id)
+            self.write_events(["late-1"], thread_id=session_id)
+            stdout, stderr = process.communicate(timeout=60)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+        self.assertEqual(process.returncode, 0, stderr)
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        self.assertTrue(lines)
+        out = json.loads(lines[-1])
+        self.assertEqual([entry["text"] for entry in out["sent"]], ["late-1"])
+        self.assertTrue(out["lockHeld"])
+
+    @unittest.skipUnless(BUN_READY, "bun is required")
+    def test_auto_claim_child_inbox(self):
+        """A child session claims its inbox by child.session_id and gets woken."""
+        session_id = "child-auto"
+        self.write_claim("bridge-b", parent_session="parent-1", child_session=session_id)
+        self.write_events(
+            ["inbox-1", "inbox-2"],
+            thread_id="parent-1",
+            child_session_id=session_id,
+            path=self.inbox_file,
+        )
+        self.write_events(
+            ["inbox-wrong"],
+            thread_id="parent-1",
+            child_session_id="other-child",
+            path=self.inbox_file,
+        )
+        out = self.run_claim("bridge-auto-claim", session_id, bridge_file=self.inbox_file)
+        self.assertEqual([entry["text"] for entry in out["sent"]], ["inbox-1", "inbox-2"])
+        self.assertTrue(
+            any("skipping invalid event" in line for line in out["logs"]),
+            out["logs"],
+        )
+        self.assertTrue(out["lockHeld"])
+        self.assertFalse(out["lockAfterShutdown"])
+
+    @unittest.skipUnless(BUN_READY, "bun is required")
+    def test_failed_injection_retries_in_same_process(self):
+        """Regression: the failed line must be restored byte-exact (with its newline)."""
+        self.write_events(["event-A", "event-B", "event-C"])
+        marker = self.base / "fail.marker"
+        marker.write_text("event-B", encoding="utf-8")
+        out = self.run_bridge(
+            "bridge-fail-retry-same-process", extra_env={"AGENT_LINK_TEST_FAIL_FILE": str(marker)}
+        )
+        self.assertEqual(
+            [entry["text"] for entry in out["sent"]],
+            ["event-A", "event-B", "event-C"],
+            "a same-process retry must restore the exact line and preserve order",
+        )
+        self.assertEqual(out["cursor"]["offset"], self.bridge_file.stat().st_size)
 
     # -- tests ---------------------------------------------------------
     @unittest.skipUnless(BUN_READY, "bun is required")

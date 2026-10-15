@@ -18,12 +18,14 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import sys
 import threading
 from typing import Any
 
 from . import cli
 from .errors import AgentLinkError, NotFoundError, ValidationError
 from .hosts.codex import CodexHost
+from .registry import entry_from_row, write_entry
 from .storage import Store
 
 #: Requests larger than this are rejected before the body is read.
@@ -41,6 +43,9 @@ ALLOWED_FIELDS = {
     "/v1/report": {"message_id", "text"},
     "/v1/ask": {"request_id", "message_id", "question", "timeout"},
     "/v1/get-request": {"request_id"},
+    "/v1/answer": {"request_id", "message_id", "answer"},
+    "/v1/child-requests": set(),
+    "/v1/get-parent-request": {"request_id"},
     "/v1/capabilities": set(),
 }
 
@@ -145,6 +150,13 @@ class Handler(BaseHTTPRequestHandler):
             args = Namespace(binding=self.server.binding_id, **data)
             if self.path == "/v1/get-request":
                 result, code = cli.cmd_get_request(store, args)
+            elif self.path == "/v1/answer":
+                result, code = cli.cmd_answer(store, args)
+            elif self.path == "/v1/get-parent-request":
+                result, code = cli.cmd_get_parent_request(store, args)
+            elif self.path == "/v1/child-requests":
+                args.pending = True
+                result, code = cli.cmd_list_parent_requests(store, args)
             else:
                 if self.path == "/v1/ask":
                     # Cap the HTTP wait before anything is persisted; the core
@@ -323,11 +335,19 @@ def main() -> int:
         driver = load_driver(args.driver)
         store = Store(args.root)
         try:
-            store.get_binding(args.binding)
+            binding_row = store.get_binding(args.binding)
         finally:
             store.close()
     except AgentLinkError as error:
         parser.error(str(error))
+
+    # Refresh the user-level registry entry so framework adapters can discover
+    # this binding by session id (see agent_link/registry.py); a failure here
+    # never blocks the service.
+    try:
+        write_entry(entry_from_row(args.root, binding_row))
+    except OSError as error:
+        print(f"agent-link: registry write failed: {error}", file=sys.stderr)
 
     service = HostService(args.root, args.binding, secrets.token_urlsafe(32), driver)
     target = Path(args.credentials)

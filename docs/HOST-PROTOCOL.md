@@ -86,6 +86,9 @@ AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
 | `/v1/report` | `{"message_id","text"}` | `binding_id`,`message_id`,`kind`,`delivery_state`,`idempotent` | 0 / 7 |
 | `/v1/ask` | `{"request_id","message_id","question","timeout"}` | `request_id`,`message_id`,`status`,`answer`,`late`,`delivery_state`,`idempotent`；阻塞到 replied/timed_out | 0 replied / 3 timed_out |
 | `/v1/get-request` | `{"request_id"}` | `status`,`late`,`answer`,`reply_message_id`,`timeout_seconds`,`deadline_epoch`,`delivery_state` 等 | 0 |
+| `/v1/answer` | `{"request_id","message_id","answer"}` | 子端答复父端发起的请求（ask-child）；`status`,`late`,`answer_message_id`,`idempotent`；语义与 CLI `answer` 一致 | 0 / 4 / 6 |
+| `/v1/child-requests` | `{}` | `parent_requests`：本 binding 待答复的父端请求（pending）列表 | 0 |
+| `/v1/get-parent-request` | `{"request_id"}` | 单条父端请求的持久化状态与答复 | 0 / 6 |
 | `/v1/capabilities` | `{}` | 当前 driver 的能力对象 | 0 |
 
 `timeout` 是数字（秒）；HTTP 层要求 `0 < timeout <= 3600`，超限在持久化**之前**返回 400。旧 CLI 的 ask 不受此 3600 上限影响（核心语义不变），该上限只是本服务的线程资源边界。
@@ -149,6 +152,8 @@ AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
 - 因此：**服务只能在父端环境启动**；子端环境没有这些依赖。
 - 桥返回只记录为 `host_accepted`；模型是否处理必须由父端实际 `reply` 证明。
 
+父端的发现、查询与回复推荐使用 Codex 专用薄 CLI `python3 -m agent_link.codex`：它按本会话 session id 从注册表发现条目，用 SQLite 只读模式校验 root 与归属后才复用核心指令，**不接受消息里的 `--root`**。用法、校验规则与 background-tasks 启动顺序见 [CODEX.md](CODEX.md)。
+
 ## 6. 其他宿主：HostDriver 注册方式
 
 `agent_link/hosts/__init__.py` 定义协议：
@@ -201,16 +206,25 @@ AGENT_LINK_BINDING=live-001 \
 ```
 
 - 桥文件旁有两个由扩展管理的派生文件：`<bridge>.lock`（单消费者锁，内容 `pid:uuid`；持有进程死亡后由下一个会话回收一次，存活则拒绝成为第二消费者）与 `<bridge>.cursor`（`{offset, dev, ino}`，逐条原子推进，重启后从断点继续并识别追加/替换/截断）。
-- 事件字段：`v`(=1)、`ts`(UTC ISO8601 毫秒)、`source`(`service`|`notifier`)、`binding_id`、`thread_id`(父会话 id)、`kind`、`message_id`、`prompt`；ask 事件另有 `request_id`。
-- 扩展每秒轮询；只注入通过校验的事件（`v==1`、`binding_id` 匹配、`prompt` 非空），以 `deliverAs:"aside"`、`attribution:"agent"` 注入后推进 cursor。JSON 非法、结构非法、binding 不匹配或单行超过 1 MiB 的事件记日志跳过，不阻塞后续事件；**注入失败的事件会保序阻塞其后所有事件**，直到重试成功。
+- 事件字段：`v`(=1)、`ts`(UTC ISO8601 毫秒)、`source`(`service`|`notifier`)、`binding_id`、`thread_id`(父会话 id)、`parent_framework`、`child_framework`、`child_session_id`、`kind`、`message_id`、`prompt`；ask 事件另有 `request_id`。
+- watcher 的目标选择：显式 `AGENT_LINK_BRIDGE_FILE` + `AGENT_LINK_BINDING` 优先；未设置时按注册表自动认领（见 §6.2）：parent 角色匹配 `parent.framework` 与本会话框架 + `parent.session_id`==本会话 id，child 角色匹配 `child.*`；自动认领模式下事件还必须 `thread_id`（父桥）/ `child_session_id`（子端 inbox）等于本会话 id。
+- 扩展每秒轮询；只注入通过校验的事件（`v==1`、`binding_id` 匹配、`prompt` 非空），以 `deliverAs:"aside"`、`attribution:"agent"` 注入后推进 cursor。JSON 非法、结构非法、binding 不匹配或单行超过 1 MiB 的事件记日志跳过，不阻塞后续事件；**注入失败的事件会保序阻塞其后所有事件**，直到重试成功。watcher 本体（锁/cursor/重试/认领）在 `extensions/shared/bridge-watcher.ts` 共享，OMP 与 Pi 适配器只是宿主胶水。
 - 写入失败（如桥目录位置被占用）由驱动抛 `DeliveryFailure`，服务记为 `failed_or_unknown`，不会产生半个事件。
 - 投递为 at-least-once：cursor 落盘前崩溃、或桥文件被整体替换时，已注入事件可能重放；不承诺 exactly-once。
 
 不使用宿主服务时，旧 CLI 也可经 notifier 兼容桥投递同一格式：`notifier_path` 指向 `agent_link/hosts/omp_notifier.py`，运行 CLI 的父端环境必须设置 `AGENT_LINK_BRIDGE_FILE` 与 `AGENT_LINK_BINDING`（缺失则投递失败，CLI exit 7）；`payload.thread_id` 必须是非空字符串。
 
+### 6.2 绑定索引（registry）与父→子通道（inbox）
+
+- `bind` 与宿主服务启动时把绑定写入用户级索引 `~/.agent-link/registry/<binding_id>.json`（0600，目录 0700；环境变量 `AGENT_LINK_REGISTRY` 可覆盖）。索引只是发现指针，权威记录仍是各 root 的 SQLite；条目丢失可由重放 bind 或启动宿主服务自愈。
+- 适配器（OMP/Pi watcher）扫描索引，把条目里 `parent.*`/`child.*` 的 framework+session_id 与本会话匹配来自动认领 binding（取 `updated_at` 最新者；显式环境变量优先）。CLI `list-bindings` 提供同一索引的人类/shell 视图（`--parent-session-id` 等过滤）。
+- 父→子通道：CLI `ask-child`/`answer`/`get-parent-request`/`list-parent-requests`，语义与子端 ask/reply 镜像（同内容重放幂等、不同内容冲突、超时/迟到答复 late=true、答复不可覆盖）。宿主服务另有 `/v1/answer`、`/v1/child-requests`、`/v1/get-parent-request`（见 §3.2）。
+- 父端请求经 `<root>/inbox/<binding_id>.jsonl` 唤醒子端会话（同一共享 watcher，child 角色认领）；事件字段同 §6.1，`kind` 为 `ask_child`、`source` 为 `parent-cli`。投递的 `host_accepted` 只表示事件可读，不表示子端已处理；子端是否答复由持久化的 answer 证明。
+- Codex 父端用 `python3 -m agent_link.codex --session-id ... [--binding ...] list|reply|get-request|ask-child|get-parent-request|list-parent-requests` 发现和操作绑定：按 `parent.framework=codex-desktop` 与 `parent.session_id` 过滤注册表，SQLite 只读校验 root/归属/run_id/config_digest 后才接受，不接受消息里的 `--root`；多条匹配必须显式 `--binding`。详见 [CODEX.md](CODEX.md)。
+
 ## 7. 子端扩展工具（Pi / OMP）
 
-`extensions/pi/agent-link.ts` 在 Pi 中注册三个模型可调用工具（`Type` 来自 `@earendil-works/pi-ai`，`defineTool`/`ExtensionAPI` 来自 `@earendil-works/pi-coding-agent`）：
+`extensions/pi/agent-link.ts` 在 Pi 中注册三个模型可调用工具（`Type` 来自 `@earendil-works/pi-ai`，`defineTool`/`ExtensionAPI` 来自 `@earendil-works/pi-coding-agent`），并带有父端桥 watcher：
 
 | 工具 | 调用 | 行为 |
 | --- | --- | --- |
@@ -220,8 +234,12 @@ AGENT_LINK_BINDING=live-001 \
 
 - 凭据来自 `AGENT_LINK_CREDENTIALS` 指向的 JSON 文件，每次调用重新读取；非 loopback/未知协议/无效 token 直接报错，不发请求。
 - 客户端超时：默认 30s；ask 为服务端 timeout + 15s 余量。abort/超时不会取消服务端等待，也不会删除请求；应以相同 ID 查询或重放。
-- 加载方式（启动步骤见 §2.2）：命令行 `--extension` 显式加载，或放入项目/用户扩展目录；不会自动读取任何父端配置或会话 ID。
-- OMP：`extensions/omp/agent-link.ts` 注册同名三工具（`pi.zod` schema，带 `loadMode:"essential"`），工具名、文案与语义与 Pi 版逐字一致；加载方式 `omp --no-extensions --extension <repo>/extensions/omp/agent-link.ts`（显式 `-e` 在 `--no-extensions` 下仍生效）。同一文件在设置了 `AGENT_LINK_BRIDGE_FILE` + `AGENT_LINK_BINDING` 的父端主会话中还充当桥 watcher（1s 轮询、`deliverAs:"aside"`、`attribution:"agent"`，见 §6.1）；子端工具调用仍只依赖 `AGENT_LINK_CREDENTIALS`。
+- 父端发起的请求（ask-child）：OMP 子端另有两个工具——`poll_parent_requests`（POST `/v1/child-requests`，列出待答复的父端请求）与 `answer_parent`（POST `/v1/answer`，答复不可覆盖）；Pi 子端暂用 CLI `answer` 答复，工具化留待后续。
+- 加载方式（启动步骤见 §2.2）：命令行 `--extension` 显式加载，或放入项目/用户扩展目录，或登记进 `~/.omp/agent/config.yml` 的 `extensions:`；不会自动读取任何父端配置或会话 ID（session id 由扩展从宿主运行时读取，见 §6.2 自动认领）。
+- OMP：`extensions/omp/agent-link.ts` 注册全部五个工具（`pi.zod` schema，带 `loadMode:"essential"`），工具名、文案与语义与 Pi 版同名工具逐字一致。同一文件还充当桥 watcher（共享实现见 `extensions/shared/bridge-watcher.ts`）：显式环境变量优先，否则按注册表自动认领，可同时持有父桥与子端 inbox 两个 watcher。
+- Pi：`extensions/pi/agent-link.ts` 三个子端工具（`Type`/`defineTool`）+ 父端 watcher（同一共享模块；注入按 Pi 语义：空闲 `sendUserMessage` 起一轮，忙碌 `deliverAs:"followUp"` 排队）。
+- OpenCode：`extensions/opencode/agent-link.ts` 是 v2 插件（`{id, setup}`；`ctx.tool.transform` 注册五个子端工具，语义与 OMP 逐字一致；注入用 `ctx.session.prompt({delivery:"queue"})`）；watcher 复用同一共享模块（framework "opencode"，父子两角色；插件是 server 级，会话归属取最近活跃会话，多会话并发时为近似——见文件头注释）。父端驱动 `agent_link.hosts.opencode:OpenCodeHost`（OmpHost 薄子类，同一文件桥）。本机 2.0.29 只接受 v2 插件形态（v1 工厂形态被拒绝）。
+- Codex 子端：尚无适配器与 inbox watcher；`ask-child` 对它不会自动唤醒，不要承诺。Codex 作为父端的发现/回复见 [CODEX.md](CODEX.md)。
 
 ## 8. 测试与已验证 / 未验证
 
@@ -238,12 +256,16 @@ PI_CODING_AGENT_ROOT=<pi 包根> node tests/pi/extension_unit.test.mjs
 
 - `tests/test_host.py`：认证/**未知字段**/方法/路径 JSON 错误、body 限制、超时上限、**并发同消息单次投递**、驱动失败不重投、跨 binding 隔离、**服务重启重放不重投**、请求体读超时 408、凭据不覆盖/只删自己的。
 - `tests/test_pi_extension.py`：jiti 加载真实扩展 + fake `ExtensionAPI`；真实 `agent_link.host` + notifier stub（走旧 CLI `reply`）闭环：report/ask/get-request、超时后迟到答复、重启重放；`pi --help` 用探针扩展验证 Pi 真实加载扩展（无模型、无会话）。
-- `tests/pi/extension_unit.test.mjs`：工具注册、凭据校验、HTTP 错误、timeout 结果、abort。
+- `tests/pi/extension_unit.test.mjs`：工具注册、凭据校验、HTTP 错误、timeout 结果、abort、父端 watcher（env 注入空闲/忙碌、自动认领匹配/不匹配、迟到 binding 发现、注入失败保序）。
 - `tests/test_omp_host.py`：OmpHost capabilities 与桥事件 schema、服务闭环（report 幂等不重发、ask 经 CLI `reply` 闭环）、`<root>/omp-bridge` 写失败记 `failed_or_unknown`、`omp_notifier.py` 旧 CLI 路径与缺环境变量失败。
-- `tests/test_omp_extension.py`（驱动脚本 `tests/omp/tool_loop.mjs`）：Bun 加载真实扩展对真实 `agent_link.host` + OmpHost 闭环；父端桥验收（重启恢复、注入失败保序阻塞、第二消费者拒绝与陈旧锁回收、会话切换换锁、文件替换/截断从零重放、超长与非法事件跳过）；真实 `omp --mode rpc` 的 `dumpTools` 注册三个工具（无模型）。
+- `tests/test_omp_extension.py`（驱动脚本 `tests/omp/tool_loop.mjs`）：Bun 加载真实扩展对真实 `agent_link.host` + OmpHost 闭环（含父→子 poll/answer）；父端桥验收（重启恢复、注入失败保序阻塞与同进程重试、第二消费者拒绝与陈旧锁回收、会话切换换锁、文件替换/截断从零重放、超长与非法事件跳过、按 session id 自动认领与迟到 binding 发现、子端 inbox 认领）；真实 `omp --mode rpc` 的 `dumpTools` 注册五个工具（无模型）。
+- `tests/test_registry.py`：绑定注册表（写入权限/原子替换/重放保留 created_at/过滤/CLI bind 联动/宿主服务自愈重建）。
+- `tests/test_parent_requests.py`：父→子通道 CLI 闭环（inbox 事件字段、answered/超时/迟到答复、幂等与冲突、跨请求答复冲突、pending 过滤）、服务 `/v1/answer`/`/v1/child-requests`/`/v1/get-parent-request`。
+- `tests/test_codex.py`：Codex 父端 helper 的注册表发现与只读校验（多绑定不可选错、跨会话/错框架/陈旧摘要与 run_id 拒绝、丢 DB 不新建、坏条目带原因）、reply 与 ask-child/answer 临时数据库闭环（模拟子端，不发桌面消息）、`--root` 不被接受、session 环境变量回退、wrapper 从 `/tmp` 两种分发与 repo-location.json 定位、prompt 提示的框架隔离与 shell 引号。
+- `tests/test_opencode_extension.py`（`tests/opencode/` harness + driver）：v2 插件 fake ctx 五工具闭环、watcher 全套（env 注入/恢复/保序/双消费者/会话切换/替换截断/超大非法/自动认领四组）、真实 `opencode serve` 隔离 HOME 注册（无模型）。
 
-已验证：上述 loopback 闭环、Pi 扩展注册与调用、OMP 扩展在真实 OMP 18.11.1 下的加载与工具注册（`dumpTools` 列表）、OMP 父端桥六组验收（全部无模型）、真实 OMP 会话注入实测（`--mode rpc` 空闲会话收到桥事件后启动一轮，模型实际回答 `bridge-ok`；`.lock` 由真实 1s 轮询持有与释放，`.cursor.offset` 推进到文件大小）、旧 CLI 全量测试。
-未验证/不承诺：真实桌面新服务的通知投递（本轮避免与父任务冲突，未发真实桌面消息）、OMP 忙碌会话（轮次进行中）的注入行为与父轮次结束后的唤醒（空闲会话 `aside` 启动一轮已实测；其余语义依据上游 extensions.md（main））、LLM 端到端工具调用（模型实际调用三个工具，只验证了扩展加载、工具执行与注入后的一轮回答）、跨机器/MCP/Intercom、恶意同用户隔离、应用重启后的通知可靠性、exactly-once 投递。
+已验证：上述 loopback 闭环、Pi 扩展注册与调用、OMP 扩展在真实 OMP 18.11.1 下的加载与工具注册（`dumpTools` 列表）、OMP 父端桥六组验收（全部无模型）、真实 OMP 会话注入实测（`--mode rpc` 空闲会话收到桥事件后启动一轮，模型实际回答 `bridge-ok`；`.lock` 由真实 1s 轮询持有与释放，`.cursor.offset` 推进到文件大小）、OMP 子端真实模型工具调用（后台任务：`omp -p` + 真实扩展的模型实际调用 `report_parent`/`ask_parent` 并收到父端 CLI `reply` 的答复，桥文件与数据库为服务端证据）、绑定注册表与按 session id 自动认领（OMP/Pi watcher 无模型验收）、父→子通道（ask-child/answer CLI 与宿主服务闭环、OMP 子端 inbox 唤醒与工具，全部无模型）、Pi 父端 watcher（无模型验收，共享同一 watcher 模块）、OpenCode 适配器（v2 插件注册与五工具、共享 watcher 场景、真实 `opencode serve` 隔离环境注册，均无模型）、旧 CLI 全量测试。
+未验证/不承诺：真实桌面新服务的通知投递（本轮避免与父任务冲突，未发真实桌面消息）、OMP 忙碌会话（轮次进行中）的注入行为与父轮次结束后的唤醒（空闲会话 `aside` 启动一轮已实测；其余语义依据上游 extensions.md（main））、Pi 侧的 LLM 端到端工具调用（OMP 侧已实测：模型实际调用 `report_parent`/`ask_parent`；Pi 侧只验证了扩展加载、工具执行与注入后的一轮回答）、OpenCode 的 LLM 端到端与忙碌/唤醒细节（v2 插件注册已实测；一次空闲注入唤醒来自意外探测，其余未验）、Codex 子端适配与 Pi 子端 inbox 自动唤醒（均未实现）、跨机器/MCP/Intercom、恶意同用户隔离、应用重启后的通知可靠性、exactly-once 投递。
 
 如需复查真实会话注入（会调用一次当前配置的模型，仅手动执行，不属于默认测试）：
 

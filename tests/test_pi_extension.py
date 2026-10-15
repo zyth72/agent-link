@@ -22,6 +22,7 @@ import unittest
 from pathlib import Path
 
 from agent_link.storage import Store
+from tests import isolate_registry
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXTENSION = REPO_ROOT / "extensions" / "pi" / "agent-link.ts"
@@ -106,6 +107,7 @@ class PiExtensionE2ECase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        isolate_registry(self)
         self.base = Path(self.temp.name)
         self.root = self.base / "state"
         self.stub = self.base / "notifier_stub.py"

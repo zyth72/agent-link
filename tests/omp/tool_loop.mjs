@@ -18,7 +18,7 @@ import { fakeOmp, loadOmpExtension, makeCtx, sleep, waitFor } from "./harness.mj
 
 const scenario = process.argv[2];
 const ids = JSON.parse(process.env.AGENT_LINK_TEST_IDS ?? "{}");
-const bridgeFile = process.env.AGENT_LINK_BRIDGE_FILE;
+const bridgeFile = process.env.AGENT_LINK_BRIDGE_FILE ?? process.env.AGENT_LINK_TEST_BRIDGE_FILE;
 const factory = await loadOmpExtension();
 const { pi, tools, lifecycle, sent, logs } = fakeOmp();
 factory(pi);
@@ -95,6 +95,13 @@ if (scenario === "child-happy") {
     timeout: 20,
   });
   out.check = await run("check", "check_parent_request", { request_id: ids.request_id });
+  // Parent->child channel: poll the pending parent request and answer it.
+  out.poll = await run("poll", "poll_parent_requests", {});
+  out.answer = await run("answer", "answer_parent", {
+    request_id: ids.parent_request_id,
+    message_id: ids.parent_answer_message_id,
+    answer: "child answer",
+  });
   console.log(JSON.stringify(out));
 } else if (scenario === "bridge") {
   const owner = makeCtx();
@@ -160,6 +167,48 @@ if (scenario === "child-happy") {
       logs,
     }),
   );
+} else if (scenario === "bridge-auto-claim" || scenario === "bridge-auto-claim-late") {
+  // No AGENT_LINK_BRIDGE_FILE/AGENT_LINK_BINDING: the watcher must resolve the
+  // binding itself from the registry by matching this session's id.
+  const owner = makeCtx({ sessionId: process.env.AGENT_LINK_TEST_SESSION_ID });
+  await fireLifecycle("session_start", owner.ctx);
+  if (scenario === "bridge-auto-claim-late") {
+    // The claim appears after session start; keep pumping timers until the
+    // rescan attaches and consumes the events.
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline && sent.length === 0) {
+      for (const timer of owner.timers) timer.callback();
+      await sleep(50);
+    }
+  }
+  await driveUntilStable(owner);
+  const lockHeld = lockToken() !== null;
+  await fireLifecycle("session_shutdown", owner.ctx);
+  await sleep(150);
+  console.log(
+    JSON.stringify({
+      sent,
+      cursor: readCursor(),
+      logs,
+      lockHeld,
+      lockAfterShutdown: lockToken() !== null,
+    }),
+  );
+} else if (scenario === "bridge-fail-retry-same-process") {
+  // One-shot injection failure inside one process: the next tick must retry
+  // the exact same bytes (regression: the failed line must be restored with
+  // its newline, otherwise it merges with the next line and both are lost).
+  const owner = makeCtx();
+  await fireLifecycle("session_start", owner.ctx);
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline && sent.length < 3) {
+    for (const timer of owner.timers) timer.callback();
+    await sleep(50);
+  }
+  await driveUntilStable(owner);
+  await fireLifecycle("session_shutdown", owner.ctx);
+  await sleep(150);
+  console.log(JSON.stringify({ sent, cursor: readCursor(), logs }));
 } else {
   throw new Error(`unknown scenario ${scenario}`);
 }

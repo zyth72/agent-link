@@ -20,6 +20,7 @@ from agent_link.errors import AgentLinkError
 from agent_link.host import HostService, load_driver
 from agent_link.hosts.omp import OmpHost, bridge_path
 from agent_link.storage import Store
+from tests import isolate_registry
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,6 +29,7 @@ class OmpHostTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        isolate_registry(self)
         self.root = Path(self.temp.name) / "state"
         notifier = Path(self.temp.name) / "stub.py"
         notifier.write_text("def bridge(p):\n    return {}\n", encoding="utf-8")
@@ -125,6 +127,9 @@ class OmpHostTest(unittest.TestCase):
         self.assertEqual(report_event["message_id"], "m-r")
         self.assertEqual(report_event["binding_id"], "b")
         self.assertEqual(report_event["thread_id"], "parent")
+        self.assertEqual(report_event["parent_framework"], "omp")
+        self.assertEqual(report_event["child_framework"], "omp")
+        self.assertEqual(report_event["child_session_id"], "child-b")
         self.assertRegex(report_event["ts"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
         self.assertIn("[agent-link:report]", report_event["prompt"])
         self.assertIn("progress text", report_event["prompt"])
@@ -230,6 +235,8 @@ class OmpHostTest(unittest.TestCase):
         self.assertEqual(events[0]["source"], "notifier")
         self.assertEqual(events[0]["binding_id"], "cli-b")
         self.assertEqual(events[0]["thread_id"], "parent-cli")
+        self.assertEqual(events[0]["parent_framework"], "omp")
+        self.assertEqual(events[0]["child_session_id"], "child-cli")
         self.assertIn("[agent-link:report]", events[0]["prompt"])
         self.assertIn("hello", events[0]["prompt"])
 

@@ -94,6 +94,7 @@ export function makeCtx(options = {}) {
         notifies.push({ message: String(message), level: String(level) });
       },
     },
+    sessionManager: { getSessionId: () => options.sessionId },
   };
   return { ctx, timers, cleared, notifies };
 }

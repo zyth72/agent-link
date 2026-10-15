@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 from agent_link.errors import ValidationError
+from tests import isolate_registry
 from agent_link.host import (
     MAX_BODY_BYTES,
     MAX_HTTP_ASK_TIMEOUT_SECONDS,
@@ -73,6 +74,7 @@ class HostTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        isolate_registry(self)
         self.root = Path(self.temp.name) / "state"
         notifier = Path(self.temp.name) / "stub.py"
         notifier.write_text("def bridge(p):\n    return {}\n", encoding="utf-8")
@@ -330,7 +332,16 @@ class HostTest(unittest.TestCase):
             with socket.create_connection(("127.0.0.1", self.service.server_port), timeout=5) as conn:
                 conn.sendall(request)  # headers only, body never sent
                 conn.settimeout(5)
-                response = conn.recv(4096)
+                # The response closes the connection; headers and body may
+                # arrive in separate TCP segments, so read until EOF instead
+                # of trusting a single recv to contain both.
+                chunks = []
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                response = b"".join(chunks)
         self.assertIn(b"408", response.split(b"\r\n", 1)[0])
         self.assertIn(b"request_timeout", response)
         self.assertIn(b"application/json", response)

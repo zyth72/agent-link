@@ -16,3 +16,6 @@ runtime-pi*.stderr
 
 # Raw experiment workspace; sanitized notes live in docs/experiments/
 /experiments/
+
+# Machine-local standalone skill location
+/skills/agent-link/scripts/repo-location.json

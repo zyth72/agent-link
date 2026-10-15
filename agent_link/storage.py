@@ -32,6 +32,7 @@ from pathlib import Path
 from .errors import ConflictError, NotFoundError, ValidationError
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+DB_FILENAME = "agent_link.sqlite3"
 WALL_CLOCK_JUMP_TOLERANCE_SECONDS = 2.0
 
 SCHEMA_STATEMENTS = (
@@ -85,6 +86,30 @@ SCHEMA_STATEMENTS = (
     """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_binding_message
         ON requests (binding_id, message_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS parent_requests (
+        binding_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        question TEXT NOT NULL,
+        timeout_seconds REAL NOT NULL,
+        deadline_epoch REAL NOT NULL,
+        status TEXT NOT NULL,
+        answer TEXT,
+        answer_message_id TEXT,
+        late INTEGER NOT NULL DEFAULT 0,
+        delivery_state TEXT NOT NULL,
+        delivery_detail TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        answered_at TEXT,
+        PRIMARY KEY (binding_id, request_id)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_parent_requests_binding_message
+        ON parent_requests (binding_id, message_id)
     """,
     """
     CREATE TABLE IF NOT EXISTS events (
@@ -206,7 +231,7 @@ class Store:
             os.chmod(self.root, 0o700)
         except OSError:
             pass
-        self.db_path = self.root / "agent_link.sqlite3"
+        self.db_path = self.root / DB_FILENAME
         self.conn = sqlite3.connect(str(self.db_path), timeout=30.0, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA busy_timeout = 30000")
@@ -668,4 +693,270 @@ class Store:
             "late": bool(late),
             "answer": answer,
             "idempotent": False,
+        }
+
+    # -- parent -> child requests (mirror of the child -> parent ask) ----
+    #
+    # The parent initiates with ask-child; the child answers with answer.
+    # Same semantics as the child side: identical request/message/question/
+    # timeout replays keep the original deadline, any mismatch conflicts, an
+    # answer can never be overwritten, and an answer at or past the persisted
+    # deadline is stored late=true with the request staying timed_out.
+
+    def _parent_request_row(self, binding_id: str, request_id: str):
+        return self.conn.execute(
+            "SELECT * FROM parent_requests WHERE binding_id = ? AND request_id = ?",
+            (binding_id, request_id),
+        ).fetchone()
+
+    def _parent_request_result(self, row) -> dict:
+        result = dict(row)
+        result["late"] = bool(result["late"])
+        return result
+
+    def prepare_parent_ask(
+        self, binding_id: str, request_id: str, message_id: str, question: str, timeout_seconds: float
+    ) -> dict:
+        validate_identifier(request_id, "request_id")
+        validate_identifier(message_id, "message_id")
+        require_text(question, "question")
+        timeout_seconds = validate_timeout_seconds(timeout_seconds)
+        self.get_binding(binding_id)
+        now = utc_now_iso()
+        with self._write():
+            owner = self.conn.execute(
+                "SELECT request_id FROM parent_requests WHERE binding_id = ? AND message_id = ?",
+                (binding_id, message_id),
+            ).fetchone()
+            if owner is not None and owner["request_id"] != request_id:
+                raise ConflictError(
+                    f"message_id {message_id!r} is already bound to parent request_id"
+                    f" {owner['request_id']!r}"
+                )
+            request = self._parent_request_row(binding_id, request_id)
+            if request is not None:
+                if request["message_id"] != message_id:
+                    raise ConflictError(
+                        f"request_id {request_id!r} is already bound to message_id"
+                        f" {request['message_id']!r}"
+                    )
+                if (
+                    request["question"] != question
+                    or float(request["timeout_seconds"]) != timeout_seconds
+                ):
+                    raise ConflictError(
+                        f"request_id {request_id!r} was already created with a different"
+                        " question or timeout"
+                    )
+                self._event("parent_ask_replay", binding_id=binding_id, request_id=request_id)
+                return {"new": False, "request": dict(request)}
+            deadline_epoch = time.time() + timeout_seconds
+            self.conn.execute(
+                "INSERT INTO parent_requests (binding_id, request_id, message_id, question,"
+                " timeout_seconds, deadline_epoch, status, late, delivery_state,"
+                " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0,"
+                " 'persisted', ?, ?)",
+                (binding_id, request_id, message_id, question, timeout_seconds, deadline_epoch, now, now),
+            )
+            self._event(
+                "parent_ask_persisted",
+                binding_id=binding_id,
+                message_id=message_id,
+                request_id=request_id,
+            )
+            return {"new": True, "request": dict(self._parent_request_row(binding_id, request_id))}
+
+    def mark_parent_dispatching(self, binding_id: str, request_id: str) -> None:
+        with self._write():
+            self.conn.execute(
+                "UPDATE parent_requests SET delivery_state = 'dispatching', updated_at = ?"
+                " WHERE binding_id = ? AND request_id = ?",
+                (utc_now_iso(), binding_id, request_id),
+            )
+            self._event("parent_request_dispatching", binding_id=binding_id, request_id=request_id)
+
+    def mark_parent_delivery(self, binding_id: str, request_id: str, state: str, detail=None) -> None:
+        with self._write():
+            self.conn.execute(
+                "UPDATE parent_requests SET delivery_state = ?, delivery_detail = ?,"
+                " updated_at = ? WHERE binding_id = ? AND request_id = ?",
+                (
+                    state,
+                    None if detail is None else str(detail)[:2000],
+                    utc_now_iso(),
+                    binding_id,
+                    request_id,
+                ),
+            )
+            self._event(
+                "parent_request_delivery",
+                binding_id=binding_id,
+                request_id=request_id,
+                detail={"state": state},
+            )
+
+    def wait_for_parent_request(
+        self,
+        binding_id: str,
+        request_id: str,
+        mono_deadline: float,
+        start_wall: float,
+        start_mono: float,
+        poll_interval: float = 0.1,
+    ) -> dict:
+        jump_logged = False
+        while True:
+            row = self._parent_request_row(binding_id, request_id)
+            if row is None:
+                raise NotFoundError(f"unknown parent request_id {request_id!r}")
+            if row["status"] in ("answered", "timed_out"):
+                return self._parent_request_result(row)
+            now_mono = time.monotonic()
+            if not jump_logged:
+                drift = abs((time.time() - start_wall) - (now_mono - start_mono))
+                if drift > WALL_CLOCK_JUMP_TOLERANCE_SECONDS:
+                    with self._write():
+                        self._event(
+                            "wall_clock_jump_observed",
+                            binding_id=binding_id,
+                            request_id=request_id,
+                            detail={"drift_seconds": round(drift, 3), "direction": "parent_request"},
+                        )
+                    jump_logged = True
+            if now_mono >= mono_deadline:
+                with self._write():
+                    current = self._parent_request_row(binding_id, request_id)
+                    if current is not None and current["status"] == "pending":
+                        self.conn.execute(
+                            "UPDATE parent_requests SET status = 'timed_out', updated_at = ?"
+                            " WHERE binding_id = ? AND request_id = ? AND status = 'pending'",
+                            (utc_now_iso(), binding_id, request_id),
+                        )
+                        self._event(
+                            "parent_request_timed_out", binding_id=binding_id, request_id=request_id
+                        )
+                    current = self._parent_request_row(binding_id, request_id)
+                return self._parent_request_result(current)
+            time.sleep(min(poll_interval, max(0.01, mono_deadline - now_mono)))
+
+    def get_parent_request(self, binding_id: str, request_id: str) -> dict:
+        validate_identifier(request_id, "request_id")
+        self.get_binding(binding_id)
+        row = self._parent_request_row(binding_id, request_id)
+        if row is None:
+            raise NotFoundError(f"unknown parent request_id {request_id!r} for binding {binding_id!r}")
+        # Same deadline rule as waiting: a pending request past its persisted
+        # deadline is timed_out even if no waiter updated the row.
+        if row["status"] == "pending" and time.time() >= row["deadline_epoch"]:
+            with self._write():
+                current = self._parent_request_row(binding_id, request_id)
+                if (
+                    current is not None
+                    and current["status"] == "pending"
+                    and time.time() >= current["deadline_epoch"]
+                ):
+                    self.conn.execute(
+                        "UPDATE parent_requests SET status = 'timed_out', updated_at = ?"
+                        " WHERE binding_id = ? AND request_id = ? AND status = 'pending'",
+                        (utc_now_iso(), binding_id, request_id),
+                    )
+                    self._event(
+                        "parent_request_timed_out", binding_id=binding_id, request_id=request_id
+                    )
+                row = self._parent_request_row(binding_id, request_id)
+        return self._parent_request_result(row)
+
+    def list_parent_requests(self, binding_id: str, *, pending_only: bool = False) -> list[dict]:
+        self.get_binding(binding_id)
+        rows = self.conn.execute(
+            "SELECT * FROM parent_requests WHERE binding_id = ? ORDER BY created_at, request_id",
+            (binding_id,),
+        ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            if item["status"] == "pending" and time.time() >= item["deadline_epoch"]:
+                # Reuse the read path so the deadline rule applies here too.
+                item = self.get_parent_request(binding_id, row["request_id"])
+            else:
+                item = self._parent_request_result(item)
+            if pending_only and item["status"] != "pending":
+                continue
+            results.append(item)
+        return results
+
+    def answer_parent_request(
+        self, binding_id: str, request_id: str, message_id: str, answer: str
+    ) -> dict:
+        """Store the child's answer to a parent-initiated request (mirror of reply)."""
+        validate_identifier(request_id, "request_id")
+        validate_identifier(message_id, "message_id")
+        require_text(answer, "answer")
+        self.get_binding(binding_id)
+        with self._write():
+            request = self._parent_request_row(binding_id, request_id)
+            if request is None:
+                raise NotFoundError(
+                    f"unknown parent request_id {request_id!r} for binding {binding_id!r}"
+                )
+            # An answer message is identified by (message_id, target request_id);
+            # the check runs inside this write transaction so two independent
+            # connections cannot both win.
+            owner = self.conn.execute(
+                "SELECT request_id FROM parent_requests WHERE binding_id = ? AND answer_message_id = ?",
+                (binding_id, message_id),
+            ).fetchone()
+            if owner is not None and owner["request_id"] != request_id:
+                raise ConflictError(
+                    f"message_id {message_id!r} was already used as an answer to parent request_id"
+                    f" {owner['request_id']!r}; one answer message cannot answer two requests"
+                )
+            if request["status"] == "answered":
+                if request["answer_message_id"] == message_id and request["answer"] == answer:
+                    return self._answer_outcome(request, idempotent=True)
+                raise ConflictError(
+                    f"parent request_id {request_id!r} already has an answer; overwriting is not allowed"
+                )
+            if request["status"] == "timed_out" and request["answer"] is not None:
+                if request["answer_message_id"] == message_id and request["answer"] == answer:
+                    return self._answer_outcome(request, idempotent=True)
+                raise ConflictError(
+                    f"parent request_id {request_id!r} timed out and already has a stored late answer"
+                )
+            # A timed-out parent request can never turn into an on-time answer,
+            # even if a wall-clock rollback moves time before the deadline.
+            # Arrival exactly at the deadline counts as timed out (>=).
+            already_timed_out = request["status"] == "timed_out"
+            late = 1 if already_timed_out or time.time() >= request["deadline_epoch"] else 0
+            status = "timed_out" if late else "answered"
+            self.conn.execute(
+                "UPDATE parent_requests SET status = ?, late = ?, answer = ?,"
+                " answer_message_id = ?, answered_at = ?, updated_at = ?"
+                " WHERE binding_id = ? AND request_id = ?",
+                (status, late, answer, message_id, utc_now_iso(), utc_now_iso(), binding_id, request_id),
+            )
+            self._event(
+                "late_parent_answer_recorded" if late else "parent_answer_recorded",
+                binding_id=binding_id,
+                request_id=request_id,
+                message_id=message_id,
+            )
+        return {
+            "request_id": request_id,
+            "request_message_id": request["message_id"],
+            "status": status,
+            "late": bool(late),
+            "answer": answer,
+            "idempotent": False,
+        }
+
+    @staticmethod
+    def _answer_outcome(request, *, idempotent: bool) -> dict:
+        return {
+            "request_id": request["request_id"],
+            "request_message_id": request["message_id"],
+            "status": request["status"],
+            "late": bool(request["late"]),
+            "answer": request["answer"],
+            "idempotent": idempotent,
         }

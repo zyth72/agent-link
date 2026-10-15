@@ -65,6 +65,13 @@ report --binding ID --message-id ID --text TEXT
 ask --binding ID --request-id ID --message-id ID --question TEXT --timeout SECONDS
 reply --binding ID --request-id ID --message-id ID --answer TEXT
 get-request --binding ID --request-id ID
+ask-child --binding ID --request-id ID --message-id ID --question TEXT --timeout SECONDS
+answer --binding ID --request-id ID --message-id ID --answer TEXT
+get-parent-request --binding ID --request-id ID
+list-parent-requests --binding ID [--pending]
+list-bindings [--parent-session-id ID] [--child-session-id ID] [--parent-framework F] [--child-framework F]
+
+ask-child/answer 是父→子通道（语义与 ask/reply 镜像，HOST-PROTOCOL §6.2）。bind 还会把绑定写入用户级绑定索引（~/.agent-link/registry/，AGENT_LINK_REGISTRY 可覆盖），框架适配器用它按本会话 session id 自动认领绑定；list-bindings 读取该索引（--root 接受但不使用）。
 
 bind 配置 JSON：binding_id、run_id、native_task_id、parent={framework,session_id}、child={framework,session_id}、notifier_path。回复 answer 是文本。ask 的成功 JSON 必须包含 request_id、answer、late、status。CLI 不在命令行传任何密钥。
 

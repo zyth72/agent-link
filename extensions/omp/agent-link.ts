@@ -3,36 +3,31 @@
  *
  * Two roles share this one extension:
  *
- * Child tools -- when the parent host service wrote an AGENT_LINK_CREDENTIALS
- * file, report_parent / ask_parent / check_parent_request behave exactly like
- * the Pi extension's tools (same names, labels, texts and semantics).  They
- * cannot choose a parent session, create bindings or reply.
+ * Child tools -- with an AGENT_LINK_CREDENTIALS file from the parent host
+ * service, report_parent / ask_parent / check_parent_request behave exactly
+ * like the Pi extension's tools (same names, labels, texts and semantics);
+ * answer_parent / poll_parent_requests serve parent-initiated requests
+ * (ask_child).  They cannot choose a parent session, create bindings or reply
+ * to their own requests.
  *
- * Parent bridge watcher -- when AGENT_LINK_BRIDGE_FILE and AGENT_LINK_BINDING
- * are set, the main session polls the bridge JSONL file written by
- * agent_link.hosts.omp:OmpHost (or the omp_notifier CLI bridge) and injects
- * validated events into the session with pi.sendUserMessage.  A single
- * consumer lock (<bridge>.lock) keeps a second session from consuming the same
- * file; the persisted cursor (<bridge>.cursor, with file identity) resumes
- * across restarts and detects append/replace/truncate.
+ * Bridge watchers -- with AGENT_LINK_BRIDGE_FILE + AGENT_LINK_BINDING set, the
+ * main session consumes that parent bridge file explicitly.  Without them, the
+ * session auto-claims from the user-level registry (~/.agent-link/registry/,
+ * override AGENT_LINK_REGISTRY): a binding whose parent.session_id matches this
+ * session makes it watch <root>/omp-bridge/<binding>.jsonl (child->parent), and
+ * a binding whose child.session_id matches makes it watch
+ * <root>/inbox/<binding>.jsonl (parent->child); a session may hold both at
+ * once.  Validated events are injected with pi.sendUserMessage
+ * (deliverAs:"aside", attribution:"agent").  Per-file single-consumer lock
+ * (<file>.lock) and persisted cursor (<file>.cursor, with file identity) apply
+ * to each watched file; the watcher itself is shared with the Pi adapter in
+ * extensions/shared/bridge-watcher.ts.
  *
  * Delivery is at-least-once: an event is replayed if the process dies after
  * injection but before the cursor is persisted, and a wholesale replacement of
  * the bridge file replays it from the start.  An event whose injection keeps
  * failing blocks later events until it succeeds so the order is preserved.
  */
-import { randomUUID } from "node:crypto";
-import { setTimeout as sleep } from "node:timers/promises";
-import {
-  open,
-  readFile,
-  rename,
-  stat,
-  unlink,
-  writeFile,
-  type FileHandle,
-  type Stats,
-} from "node:fs/promises";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import {
   ASK_RESPONSE_GRACE_MS,
@@ -40,35 +35,20 @@ import {
   asText,
   callHost,
 } from "../shared/agent-link-client";
+import {
+  startBridgeWatchers,
+  stopBridgeWatchers,
+  type BridgeHost,
+} from "../shared/bridge-watcher";
 
-/** Read window per tick and the maximum size of a single event line. */
-const MAX_WINDOW_BYTES = 1024 * 1024;
-const READ_CHUNK_BYTES = 64 * 1024;
-
+/** The ctx surface the bridge watchers need; satisfied by ExtensionContext. */
 type BridgeContext = {
   agent?: { kind?: string };
   setInterval(callback: () => void, ms: number): unknown;
   clearTimer(handle: unknown): void;
   ui: { notify(message: string, level: string): void };
+  sessionManager?: { getSessionId?: () => string | undefined };
 };
-
-type BridgeState = {
-  pi: ExtensionAPI;
-  ctx: BridgeContext;
-  bridgeFile: string;
-  binding: string;
-  lockPath: string;
-  token: string;
-  timer: unknown;
-  consumedPos: number;
-  dev: number;
-  ino: number;
-  tail: Buffer;
-  busy: boolean;
-};
-
-/** The one bridge file this process consumes; shared by all sessions. */
-let active: BridgeState | null = null;
 
 function logError(pi: ExtensionAPI, message: string): void {
   try {
@@ -78,306 +58,30 @@ function logError(pi: ExtensionAPI, message: string): void {
   }
 }
 
-async function writeCursor(state: BridgeState): Promise<void> {
-  const cursorPath = state.bridgeFile + ".cursor";
-  try {
-    await writeFile(
-      cursorPath + ".tmp",
-      JSON.stringify({ offset: state.consumedPos, dev: state.dev, ino: state.ino }),
-    );
-    await rename(cursorPath + ".tmp", cursorPath);
-  } catch (error) {
-    // The in-memory position stays authoritative; the next tick retries.
-    logError(state.pi, `Agent Link bridge watcher: cannot persist cursor: ${(error as Error).message}`);
-  }
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
 }
 
-async function handleLine(state: BridgeState, line: string): Promise<"consumed" | "failed"> {
-  let event: Record<string, unknown>;
-  try {
-    event = JSON.parse(line) as Record<string, unknown>;
-  } catch {
-    logError(state.pi, "Agent Link bridge watcher: skipping unparsable event line");
-    return "consumed";
-  }
-  if (
-    !event ||
-    typeof event !== "object" ||
-    event.v !== 1 ||
-    typeof event.prompt !== "string" ||
-    event.prompt === "" ||
-    event.binding_id !== state.binding
-  ) {
-    logError(state.pi, `Agent Link bridge watcher: skipping invalid event ${line.slice(0, 120)}`);
-    return "consumed";
-  }
-  try {
-    await state.pi.sendUserMessage(event.prompt, { deliverAs: "aside", attribution: "agent" });
-  } catch (error) {
-    logError(
-      state.pi,
-      `Agent Link bridge watcher: injection failed, will retry: ${(error as Error).message}`,
-    );
-    return "failed";
-  }
-  try {
-    state.ctx.ui.notify(`Agent Link ${event.kind ?? "message"}: ${event.message_id ?? ""}`, "info");
-  } catch {
-    // UI notification is best-effort; the event was injected either way.
-  }
-  return "consumed";
-}
-
-async function tick(): Promise<void> {
-  const state = active;
-  if (!state || state.busy) return;
-  state.busy = true;
-  let handle: FileHandle | undefined;
-  try {
-    let fileStat: Stats;
-    try {
-      fileStat = await stat(state.bridgeFile);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw error;
-    }
-    if (fileStat.dev !== state.dev || fileStat.ino !== state.ino || fileStat.size < state.consumedPos) {
-      // Replaced or truncated: restart from the beginning of the file.
-      state.consumedPos = 0;
-      state.tail = Buffer.alloc(0);
-      state.dev = fileStat.dev;
-      state.ino = fileStat.ino;
-    }
-    handle = await open(state.bridgeFile, "r");
-    while (state.tail.length < MAX_WINDOW_BYTES) {
-      const want = Math.min(READ_CHUNK_BYTES, MAX_WINDOW_BYTES - state.tail.length);
-      const buffer = Buffer.alloc(want);
-      const { bytesRead } = await handle.read(
-        buffer,
-        0,
-        want,
-        state.consumedPos + state.tail.length,
-      );
-      if (bytesRead <= 0) break;
-      state.tail = Buffer.concat([state.tail, buffer.subarray(0, bytesRead)]);
-    }
-    for (;;) {
-      const newline = state.tail.indexOf(0x0a);
-      if (newline >= 0) {
-        const line = state.tail.subarray(0, newline);
-        state.tail = state.tail.subarray(newline + 1);
-        state.consumedPos += newline + 1;
-        const outcome = await handleLine(state, line.toString("utf8"));
-        if (outcome === "failed") {
-          // Put the failed line back at the head and stop; later events wait
-          // behind it (order preserved) and the cursor is not advanced past it.
-          state.tail = Buffer.concat([line, state.tail]);
-          state.consumedPos -= newline + 1;
-          await writeCursor(state);
-          return;
-        }
-        continue;
-      }
-      if (state.tail.length < MAX_WINDOW_BYTES) break; // need more data
-      // A single event line larger than the window: log once, skip it whole
-      // and keep discarding until its terminating newline.
-      logError(
-        state.pi,
-        `Agent Link bridge watcher: skipping oversized event line (> ${MAX_WINDOW_BYTES} bytes)`,
-      );
-      state.consumedPos += state.tail.length;
-      state.tail = Buffer.alloc(0);
-      let terminated = false;
-      for (;;) {
-        const buffer = Buffer.alloc(READ_CHUNK_BYTES);
-        const { bytesRead } = await handle.read(buffer, 0, READ_CHUNK_BYTES, state.consumedPos);
-        if (bytesRead <= 0) break;
-        const chunk = buffer.subarray(0, bytesRead);
-        const nextNewline = chunk.indexOf(0x0a);
-        if (nextNewline >= 0) {
-          state.tail = Buffer.from(chunk.subarray(nextNewline + 1));
-          state.consumedPos += nextNewline + 1;
-          terminated = true;
-          break;
-        }
-        state.consumedPos += bytesRead;
-      }
-      if (!terminated) break; // EOF while discarding the oversized line
-    }
-    await writeCursor(state);
-  } catch (error) {
-    logError(state.pi, `Agent Link bridge watcher: tick failed: ${(error as Error).message}`);
-  } finally {
-    if (handle) {
+/** Host-specific behavior for the shared bridge watcher (shared/bridge-watcher.ts). */
+function bridgeHost(pi: ExtensionAPI, ctx: BridgeContext): BridgeHost<BridgeContext> {
+  return {
+    framework: "omp",
+    roles: ["parent", "child"],
+    isMain: (context) => context.agent?.kind === "main",
+    sessionId: (context) => context.sessionManager?.getSessionId?.(),
+    setTimer: (context, callback, ms) => context.setInterval(callback, ms),
+    clearTimer: (context, handle) => context.clearTimer(handle),
+    inject: (_context, prompt) =>
+      pi.sendUserMessage(prompt, { deliverAs: "aside", attribution: "agent" }),
+    notify: (context, message, level) => {
       try {
-        await handle.close();
-      } catch {
-        // Closing a already-gone file handle is harmless.
-      }
-    }
-    state.busy = false;
-  }
-}
-
-async function stopWatcher(): Promise<void> {
-  const state = active;
-  if (!state) return;
-  active = null;
-  try {
-    state.ctx.clearTimer(state.timer);
-  } catch {
-    // The old session may already be gone; the lock still needs releasing.
-  }
-  try {
-    const owner = await readFile(state.lockPath, "utf8");
-    if (owner.trim() === state.token) await unlink(state.lockPath);
-  } catch {
-    // Missing or unreadable lock file: nothing of ours to release.
-  }
-}
-
-async function startWatcher(pi: ExtensionAPI, ctx: BridgeContext): Promise<void> {
-  // Sub sessions run in the same process and share module state; only the
-  // main session may own the bridge file.
-  if (ctx.agent?.kind !== "main") return;
-  if (active) await stopWatcher();
-  const bridgeFile = process.env.AGENT_LINK_BRIDGE_FILE;
-  const binding = process.env.AGENT_LINK_BINDING;
-  if (!bridgeFile || !binding) {
-    const message =
-      "Agent Link bridge watcher disabled: set AGENT_LINK_BRIDGE_FILE and AGENT_LINK_BINDING";
-    logError(pi, message);
-    try {
-      ctx.ui.notify(message, "error");
-    } catch {
-      // Notifying is best-effort.
-    }
-    return;
-  }
-  const lockPath = bridgeFile + ".lock";
-  const token = `${process.pid}:${randomUUID()}`;
-  let acquired = false;
-  try {
-    const handle = await open(lockPath, "wx");
-    try {
-      await handle.writeFile(token);
-    } finally {
-      await handle.close();
-    }
-    acquired = true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-      const message = `Agent Link bridge watcher failed: cannot create ${lockPath}: ${(error as Error).message}`;
-      logError(pi, message);
-      try {
-        ctx.ui.notify(message, "error");
+        context.ui.notify(message, level);
       } catch {
         // Notifying is best-effort.
       }
-      return;
-    }
-    // A lock left by a dead process is reclaimed once; a live owner wins and
-    // this session refuses to become a second consumer.
-    let owner = await readFile(lockPath, "utf8").catch(() => "");
-    if (owner.trim() === "") {
-      // The owner may be between creating the lock and writing its token;
-      // give it a moment before treating the lock as stale.
-      await sleep(50);
-      owner = await readFile(lockPath, "utf8").catch(() => "");
-    }
-    const ownerPid = Number.parseInt(owner.split(":")[0] ?? "", 10);
-    let alive = Number.isInteger(ownerPid) && ownerPid > 0;
-    if (alive) {
-      try {
-        process.kill(ownerPid, 0);
-      } catch (killError) {
-        // EPERM means the process exists but belongs to someone else.
-        alive = (killError as NodeJS.ErrnoException).code === "EPERM";
-      }
-    }
-    if (alive) {
-      const message = `Agent Link bridge watcher refused: ${bridgeFile} is already consumed by pid ${ownerPid}`;
-      logError(pi, message);
-      try {
-        ctx.ui.notify(message, "error");
-      } catch {
-        // Notifying is best-effort.
-      }
-      return;
-    }
-    try {
-      await unlink(lockPath);
-    } catch {
-      // Someone else cleaned it up first.
-    }
-    try {
-      const handle = await open(lockPath, "wx");
-      try {
-        await handle.writeFile(token);
-      } finally {
-        await handle.close();
-      }
-      acquired = true;
-    } catch (retryError) {
-      const message = `Agent Link bridge watcher failed: cannot reclaim ${lockPath}: ${(retryError as Error).message}`;
-      logError(pi, message);
-      try {
-        ctx.ui.notify(message, "error");
-      } catch {
-        // Notifying is best-effort.
-      }
-      return;
-    }
-  }
-  if (!acquired) return;
-  let consumedPos = 0;
-  let dev = 0;
-  let ino = 0;
-  let fileStat: Stats | null = null;
-  try {
-    fileStat = await stat(bridgeFile);
-    dev = fileStat.dev;
-    ino = fileStat.ino;
-  } catch {
-    // No bridge file yet: the first tick starts from zero.
-  }
-  try {
-    const cursor = JSON.parse(await readFile(bridgeFile + ".cursor", "utf8")) as Record<string, unknown>;
-    if (
-      cursor &&
-      Number.isInteger(cursor.offset) &&
-      (cursor.offset as number) >= 0 &&
-      Number.isInteger(cursor.dev) &&
-      Number.isInteger(cursor.ino) &&
-      fileStat &&
-      cursor.dev === fileStat.dev &&
-      cursor.ino === fileStat.ino &&
-      (cursor.offset as number) <= fileStat.size
-    ) {
-      consumedPos = cursor.offset as number;
-    }
-  } catch {
-    // Missing or malformed cursor: start from the beginning.
-  }
-  const state: BridgeState = {
-    pi,
-    ctx,
-    bridgeFile,
-    binding,
-    lockPath,
-    token,
-    timer: undefined,
-    consumedPos,
-    dev,
-    ino,
-    tail: Buffer.alloc(0),
-    busy: false,
+    },
+    logError: (message) => logError(pi, message),
   };
-  active = state;
-  state.timer = ctx.setInterval(() => {
-    void tick();
-  }, 1000);
-  void tick();
 }
 
 export default function agentLinkExtension(pi: ExtensionAPI) {
@@ -530,13 +234,99 @@ export default function agentLinkExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "poll_parent_requests",
+    label: "Poll parent requests",
+    description:
+      "List pending Agent Link requests your parent sent you (ask_child) that are waiting for " +
+      "your answer. Answer one with answer_parent using its request_id.",
+    loadMode: "essential",
+    parameters: z.object({}),
+    async execute(
+      _toolCallId: string,
+      _params: Record<string, never>,
+      signal: AbortSignal | undefined,
+    ) {
+      const { result, exitCode } = await callHost(
+        "child-requests",
+        {},
+        signal,
+        DEFAULT_REQUEST_TIMEOUT_MS,
+      );
+      if (exitCode !== 0) {
+        throw new Error(
+          `Agent Link child-requests failed (exit ${exitCode}): ${JSON.stringify(result)}`,
+        );
+      }
+      const rows = Array.isArray(result.parent_requests) ? result.parent_requests : [];
+      const lines = rows.map((row) => {
+        const record = asRecord(row);
+        return `${String(record?.request_id ?? "?")}: ${String(record?.question ?? "")}`;
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              lines.length === 0
+                ? "No pending parent requests."
+                : `Pending parent requests: ${lines.join("; ")}`,
+          },
+        ],
+        details: result,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "answer_parent",
+    label: "Answer parent request",
+    description:
+      "Answer a parent-initiated Agent Link request (ask_child). The answer is persisted and " +
+      "returned to the waiting parent; a second different answer is a conflict. A request past " +
+      "its deadline stores your answer with late=true.",
+    loadMode: "essential",
+    parameters: z.object({
+      request_id: z.string({ description: "The parent request id from the inbox message" }),
+      message_id: z.string({ description: "New message id for this answer" }),
+      answer: z.string({ description: "Your answer to the parent's question" }),
+    }),
+    async execute(
+      _toolCallId: string,
+      params: { request_id: string; message_id: string; answer: string },
+      signal: AbortSignal | undefined,
+    ) {
+      const { result, exitCode } = await callHost(
+        "answer",
+        params,
+        signal,
+        DEFAULT_REQUEST_TIMEOUT_MS,
+      );
+      if (exitCode !== 0) {
+        throw new Error(
+          `Agent Link answer was rejected (exit ${exitCode}): ${JSON.stringify(result)}`,
+        );
+      }
+      const late = result.late === true ? " late=true" : "";
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Answered parent request ${params.request_id}; status=${String(result.status)}${late}.`,
+          },
+        ],
+        details: result,
+      };
+    },
+  });
+
   pi.on("session_start", (_event, ctx) => {
-    void startWatcher(pi, ctx as BridgeContext);
+    void startBridgeWatchers(bridgeHost(pi, ctx as BridgeContext), ctx as BridgeContext);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
     if ((ctx as BridgeContext).agent?.kind === "main") {
-      void stopWatcher();
+      void stopBridgeWatchers();
     }
   });
 }
