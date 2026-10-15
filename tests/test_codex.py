@@ -15,13 +15,14 @@ import time
 import unittest
 from pathlib import Path
 
-from agent_link.hosts.codex import CodexHost, build_codex_prompt, build_prompt
+from agent_link.hosts.codex.parent import CodexParentAdapter, build_codex_parent_prompt
+from agent_link.shared import build_parent_prompt
 from agent_link.storage import Store
 from tests import isolate_registry
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WRAPPER = REPO_ROOT / "skills" / "agent-link" / "scripts" / "link.py"
-CODEX_CLI = [sys.executable, "-m", "agent_link.codex"]
+CODEX_CLI = [sys.executable, "-m", "agent_link.hosts.codex.cli"]
 CORE_CLI = [sys.executable, "-m", "agent_link"]
 STUB_SOURCE = '''\
 """Simulated notifier used by tests: records every bridge() attempt."""
@@ -486,7 +487,7 @@ class CodexCase(unittest.TestCase):
 
         # The prompt carried the Codex helper hints (no desktop message was sent).
         prompt = json.loads(self.wait_for_file_text(self.log).splitlines()[0])["payload"]["prompt"]
-        self.assertIn("python3 -m agent_link.codex --session-id session-1 list", prompt)
+        self.assertIn("python3 -m agent_link.hosts.codex.cli --session-id session-1 list", prompt)
         self.assertIn("--binding b-reply get-request --request-id rq-1", prompt)
         self.assertIn("--binding b-reply reply --request-id rq-1", prompt)
         self.assertIn("The child process is waiting for a reply.", prompt)
@@ -621,23 +622,23 @@ class CodexCase(unittest.TestCase):
             "timeout_seconds": 60.0,
             "deadline_epoch": 0.0,
         }
-        shared = build_prompt(root, binding, message)
+        shared = build_parent_prompt(root, binding, message)
         self.assertIn("The child process is waiting for a reply.", shared)
         self.assertIn("python3 -m agent_link --root", shared)
-        self.assertNotIn("agent_link.codex", shared, "the shared renderer must stay framework-neutral")
+        self.assertNotIn("agent_link.hosts.codex", shared, "the shared renderer must stay framework-neutral")
         quoted = "python3 -m agent_link --root " + shlex_quote(str(root.resolve()))
         self.assertIn(quoted, shared)
 
-        codex_prompt = build_codex_prompt(root, binding, message)
+        codex_prompt = build_codex_parent_prompt(root, binding, message)
         self.assertGreater(len(codex_prompt), len(shared))
-        self.assertIn("agent_link.codex", codex_prompt)
+        self.assertIn("agent_link.hosts.codex.cli", codex_prompt)
         self.assertIn("--session-id session-1", codex_prompt)
         self.assertIn("--binding b-quote get-request --request-id rq-1", codex_prompt)
-        self.assertTrue(CodexHost().build_prompt(root, binding, message).endswith(codex_prompt))
+        self.assertTrue(CodexParentAdapter().build_prompt(root, binding, message).endswith(codex_prompt))
 
         omp = dict(binding, parent_framework="omp")
-        self.assertEqual(build_codex_prompt(root, omp, message), build_prompt(root, omp, message))
-        self.assertNotIn("agent_link.codex", build_codex_prompt(root, omp, message))
+        self.assertEqual(build_codex_parent_prompt(root, omp, message), build_parent_prompt(root, omp, message))
+        self.assertNotIn("agent_link.hosts.codex.cli", build_codex_parent_prompt(root, omp, message))
 
     # -- wrapper -------------------------------------------------------
     def test_wrapper_dispatches_from_tmp_both_entry_points(self):

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Run the locally installed Agent Link implementation from any cwd.
 
-Default dispatch: the original CLI (``agent_link.cli``).  With ``--codex`` as
-the first argument the Codex desktop parent helper (``agent_link.codex``)
-handles the remaining arguments, so a skill wrapper copied outside the
-repository can offer both entry points.
+Default dispatch: the core CLI (``agent_link.cli``).  With ``--codex`` as the
+first argument the Codex desktop parent helper
+(``agent_link.hosts.codex.cli``) handles the remaining arguments; with
+``--pi-rpc`` the Pi RPC controller (``agent_link.hosts.pi.rpc``) does, so a
+skill wrapper copied outside the repository can offer all entry points.
 
 Repository location, in order:
 
@@ -62,8 +63,11 @@ def main():
     sys.path.insert(0, str(repo))
     argv = sys.argv[1:]
     if argv and argv[0] == "--codex":
-        from agent_link.codex import main as codex_main
+        from agent_link.hosts.codex.cli import main as codex_main
         return codex_main(argv[1:])
+    if argv and argv[0] == "--pi-rpc":
+        from agent_link.hosts.pi.rpc import main as pi_rpc_main
+        return pi_rpc_main(argv[1:])
     from agent_link.cli import main as cli_main
     return cli_main()
 

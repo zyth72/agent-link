@@ -1,6 +1,6 @@
-# Codex 父端 helper 细节（agent_link.codex）
+# Codex 父端 helper 细节（agent_link.hosts.codex.cli）
 
-`LINK --codex ...` 等价于 `python3 -m agent_link.codex ...`。除本文件说明的发现规则外，子命令参数、JSON 字段与退出码复用核心 CLI，见 `ABS_REPO/USAGE.md` 与 `ABS_REPO/docs/CODEX.md`。
+`LINK --codex ...` 等价于 `python3 -m agent_link.hosts.codex.cli ...`。除本文件说明的发现规则外，子命令参数、JSON 字段与退出码复用核心 CLI，见 `ABS_REPO/USAGE.md` 与 `ABS_REPO/docs/CODEX.md`。
 
 ## 命令
 

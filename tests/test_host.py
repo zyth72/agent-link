@@ -438,7 +438,7 @@ class HostTest(unittest.TestCase):
             process.stderr.close()
 
     def test_load_driver_accepts_class_instance_and_factory(self):
-        driver = load_driver("agent_link.hosts.codex:CodexHost")
+        driver = load_driver("agent_link.hosts.codex.parent:CodexParentAdapter")
         self.assertTrue(callable(driver.notify))
         self.assertTrue(callable(driver.capabilities))
         module = __import__("types").SimpleNamespace(
@@ -450,9 +450,9 @@ class HostTest(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 load_driver("x:not_a_driver")
         with self.assertRaises(ValidationError):
-            load_driver("agent_link.hosts.codex")
+            load_driver("agent_link.hosts.codex.parent")
         with self.assertRaises(ValidationError):
-            load_driver("agent_link.hosts.codex:missing_attribute")
+            load_driver("agent_link.hosts.codex.parent:missing_attribute")
 
 
 if __name__ == "__main__":

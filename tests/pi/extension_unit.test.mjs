@@ -75,7 +75,7 @@ async function startServer(handler, options = {}) {
 test("registers exactly the scoped child tools", () => {
   assert.deepEqual(
     [...tools.keys()].sort(),
-    ["ask_parent", "check_parent_request", "report_parent"],
+    ["answer_parent", "ask_parent", "check_parent_request", "report_parent"],
   );
   const askTimeout = tools.get("ask_parent").parameters.properties.timeout;
   assert.equal(askTimeout.maximum, 3600, "ask timeout stays within the host-service bound");
@@ -175,6 +175,29 @@ test("check_parent_request reads the persisted request state", async (t) => {
   assert.deepEqual(JSON.parse(host.requests[0].body), { request_id: "r-3" });
   assert.match(result.content[0].text, /status=timed_out/);
   assert.match(result.content[0].text, /stored later/);
+});
+
+test("answer_parent posts the parent-initiated answer to /v1/answer", async (t) => {
+  const host = await startServer((_req, res) =>
+    respondJson(res, 200, {
+      result: { status: "answered", late: false, idempotent: false },
+      exit_code: 0,
+    }),
+  );
+  t.after(() => host.close());
+  const result = await tools.get("answer_parent").execute("call-answer", {
+    request_id: "rq-1",
+    message_id: "am-1",
+    answer: "option A",
+  });
+  assert.equal(host.requests[0].url, "/v1/answer");
+  assert.deepEqual(JSON.parse(host.requests[0].body), {
+    request_id: "rq-1",
+    message_id: "am-1",
+    answer: "option A",
+  });
+  assert.equal(result.details.status, "answered");
+  assert.match(result.content[0].text, /Answered parent request rq-1/);
 });
 
 test("host-service HTTP errors surface as tool errors", async (t) => {

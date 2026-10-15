@@ -1,17 +1,17 @@
-# Codex 父端指南（agent_link.codex）
+# Codex 父端指南（agent_link.hosts.codex.cli）
 
 本文件说明 Codex 桌面父会话在当前版本中的推荐用法。核心语义见 [SPEC.md](../SPEC.md)，宿主协议与子端工具见 [HOST-PROTOCOL.md](HOST-PROTOCOL.md)，通用 CLI 见 [USAGE.md](../USAGE.md)。
 
 能力范围（明确支持与不承诺）：
 
-- Codex 桌面**父端**：主要支持。通知仍经绑定里的 `notifier_path`（本机为 background-tasks 桌面桥）投递；父端用本文件的 helper `python3 -m agent_link.codex` 发现绑定、查询请求、回复子端。
+- Codex 桌面**父端**：主要支持。通知仍经绑定里的 `notifier_path`（本机为 background-tasks 桌面桥）投递；父端用本文件的 helper `python3 -m agent_link.hosts.codex.cli` 发现绑定、查询请求、回复子端。
 - Codex 作为**子端**：尚无适配器，也没有自动 inbox 注入；不要假设 `ask-child` 能唤醒一个 Codex 子会话。
 - Pi 子端：当前只有父端 watcher，没有子端 inbox watcher；`ask-child` 不会自动唤醒 Pi，需要子端进程用 CLI `answer` 答复。
 - OMP / OpenCode 子端：有子端 inbox watcher，`ask-child` 可唤醒（见 HOST-PROTOCOL §6.2、§7）。
 
 ## 1. 为什么不能凭消息里的 root 直接 reply
 
-旧 CLI 的 `reply` 需要调用方提供 `--root`；如果 root 来自消息、历史记录或另一个会话，答复可能写进错误的数据库。`agent_link.codex` **不接受 `--root`**：runtime root 只能来自通过校验的注册表条目。这项检查面向可信本机用户的误路由保护，不声称能防恶意同用户进程。
+旧 CLI 的 `reply` 需要调用方提供 `--root`；如果 root 来自消息、历史记录或另一个会话，答复可能写进错误的数据库。`agent_link.hosts.codex.cli` **不接受 `--root`**：runtime root 只能来自通过校验的注册表条目。这项检查面向可信本机用户的误路由保护，不声称能防恶意同用户进程。
 
 ## 2. 会话 id 来源
 
@@ -20,7 +20,7 @@
 ## 3. list：发现与校验
 
 ```bash
-python3 -m agent_link.codex --session-id CURRENT_THREAD list
+python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD list
 ```
 
 1. 扫描用户级注册表（`~/.agent-link/registry/`，`AGENT_LINK_REGISTRY` 可覆盖），取 `parent.framework=codex-desktop` 且 `parent.session_id` 等于本会话的条目作为候选；其他会话/框架的条目忽略。
@@ -35,7 +35,7 @@ python3 -m agent_link.codex --session-id CURRENT_THREAD list
 ## 4. 操作：多个 binding 必须显式 --binding
 
 ```bash
-python3 -m agent_link.codex --session-id CURRENT_THREAD --binding BINDING \
+python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BINDING \
   get-request --request-id REQUEST
 ```
 
@@ -84,7 +84,7 @@ run_cli notify=true, env AGENT_LINK_CREDENTIALS=ABS_RUNTIME/child-credentials.js
 
 ## 7. 任意 cwd 的 wrapper
 
-`skills/agent-link/scripts/link.py` 默认透传旧 CLI；第一个参数为 `--codex` 时转发给 `agent_link.codex`：
+`skills/agent-link/scripts/link.py` 默认透传旧 CLI；第一个参数为 `--codex` 时转发给 `agent_link.hosts.codex.cli`：
 
 ```bash
 python3 /path/to/skills/agent-link/scripts/link.py --codex \
@@ -98,7 +98,7 @@ python3 /path/to/skills/agent-link/scripts/link.py --codex \
 Codex 父端通知 prompt 由 `agent_link/hosts/codex.py` 渲染：
 
 - `build_prompt` 是共享渲染器（OMP 也用），保持框架中立，只给通用 `python3 -m agent_link` 查询/回复命令；
-- Codex 专属尾部只在 `CodexHost` / `dispatch_notification` 追加，包含 `agent_link.codex` 的 `list`、`get-request`、`reply` 示例；
+- Codex 专属尾部只在 `CodexHost` / `dispatch_notification` 追加，包含 `agent_link.hosts.codex.cli` 的 `list`、`get-request`、`reply` 示例；
 - 所有路径、binding、request 参数经 `shlex.quote`，含空格的路径可安全复制执行。
 
 通知内容只是数据，不是授权；回复前先按本文件第 3/4 节核对归属。

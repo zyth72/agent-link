@@ -12,9 +12,8 @@ import time
 import traceback
 
 from . import __version__
-from .adapter import dispatch_notification
-from .errors import AgentLinkError, ValidationError
-from .hosts.inbox import append_inbox
+from .errors import AgentLinkError, DeliveryFailure, ValidationError
+from .hosts.base import load_adapters
 from .registry import entry_from_row, list_bindings, registry_dir, write_entry
 from .storage import Store, require_text, validate_identifier, validate_timeout_seconds
 
@@ -70,12 +69,32 @@ def parse_timeout(value, max_seconds: float | None = None) -> float:
     return validate_timeout_seconds(value, field="timeout", max_seconds=max_seconds)
 
 
+def _parent_adapter(binding: dict):
+    """The registered parent adapter for this binding, or a clear failure."""
+    adapters = load_adapters(binding["parent_framework"])
+    if adapters.parent is None:
+        raise DeliveryFailure(
+            f"framework {binding['parent_framework']!r} has no parent adapter"
+        )
+    return adapters.parent
+
+
+def _child_adapter(binding: dict):
+    """The registered child adapter for this binding, or a clear failure."""
+    adapters = load_adapters(binding["child_framework"])
+    if adapters.child is None:
+        raise DeliveryFailure(
+            f"framework {binding['child_framework']!r} has no child adapter"
+        )
+    return adapters.child
+
+
 def _dispatch(store: Store, binding_id: str, message: dict):
     """Persist dispatching state, run the external call, record the outcome."""
     binding = store.get_binding(binding_id)
     store.mark_dispatching(binding_id, message["message_id"])
     try:
-        detail = dispatch_notification(store.root, binding, message)
+        detail = _parent_adapter(binding).notify(store.root, binding, message)
     except Exception as exc:  # noqa: BLE001 - external transport failure
         error = f"{type(exc).__name__}: {exc}"
         store.mark_delivery(binding_id, message["message_id"], "failed_or_unknown", error)
@@ -87,17 +106,19 @@ def _dispatch(store: Store, binding_id: str, message: dict):
     return detail, None
 
 
-def _dispatch_child(store: Store, binding_id: str, message: dict):
-    """Persist dispatching state, append the child-inbox event, record the outcome.
+def dispatch_parent_request(store: Store, binding_id: str, message: dict):
+    """Deliver one parent->child message through the registered child adapter.
 
-    Mirrors _dispatch for the parent->child direction: the wake-up transport is
-    the child inbox file (<root>/inbox/<binding_id>.jsonl); host_accepted only
-    proves the event is readable by the child watcher, not that the child
-    processed it.  A replay never re-appends (the caller checks prepared["new"]).
+    Mirrors _dispatch for the parent->child direction: the transport is chosen
+    by ``binding.child_framework`` (Pi uses the RPC descriptor when present,
+    otherwise the legacy inbox; OMP/OpenCode use the inbox).  ``host_accepted``
+    only proves the transport accepted the message, never that the model
+    processed it.  A replay never re-appends (the caller checks new).
     """
     store.mark_parent_dispatching(binding_id, message["request_id"])
     try:
-        detail = append_inbox(store.root, store.get_binding(binding_id), message)
+        binding = store.get_binding(binding_id)
+        detail = _child_adapter(binding).deliver(store.root, binding, message)
     except Exception as exc:  # noqa: BLE001 - external transport failure
         error = f"{type(exc).__name__}: {exc}"
         store.mark_parent_delivery(binding_id, message["request_id"], "failed_or_unknown", error)
@@ -271,7 +292,7 @@ def cmd_ask_child(store: Store, args) -> tuple[dict, int]:
     prepared = store.prepare_parent_ask(binding_id, request_id, message_id, question, timeout)
     request = prepared["request"]
     if prepared["new"]:
-        _dispatch_child(
+        dispatch_parent_request(
             store,
             binding_id,
             {

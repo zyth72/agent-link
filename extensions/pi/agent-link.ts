@@ -4,10 +4,13 @@
  * Two roles share this one extension:
  *
  * Child tools -- when the parent host service wrote an AGENT_LINK_CREDENTIALS
- * file, report_parent / ask_parent / check_parent_request behave exactly like
- * the OMP extension's tools (same names, labels, texts and semantics).  They
- * cannot choose a parent session, create bindings or reply.
- * See docs/HOST-PROTOCOL.md.
+ * file, report_parent / ask_parent / check_parent_request / answer_parent
+ * behave exactly like the OMP extension's tools (same names, labels, texts and
+ * semantics).  They cannot choose a parent session, create bindings or reply to
+ * child-initiated asks.  answer_parent resolves a parent-initiated ask_child
+ * request; there is no polling: the RPC prompt carries the request_id and the
+ * model answers it directly.
+ * See docs/HOST-PROTOCOL.md and docs/PI-RPC.md.
  *
  * Parent bridge watcher -- when AGENT_LINK_BRIDGE_FILE and AGENT_LINK_BINDING
  * are set, the session consumes that bridge file explicitly.  Without them the
@@ -217,6 +220,49 @@ export default function (pi: ExtensionAPI) {
               text:
                 `status=${String(result.status)} late=${result.late === true} ` +
                 `answer=${asText(result.answer)} delivery_state=${asText(result.delivery_state)}`,
+            },
+          ],
+          details: result,
+        };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "answer_parent",
+      label: "Answer parent request",
+      description:
+        "Answer a parent-initiated Agent Link request (ask_child). The answer is persisted and " +
+        "returned to the waiting parent; a second different answer is a conflict. A request past " +
+        "its deadline stores your answer with late=true. This is how a Pi RPC child answers after " +
+        "receiving a question prompt; no polling is needed.",
+      parameters: Type.Object({
+        request_id: Type.String({ description: "The parent request id from the question prompt" }),
+        message_id: Type.String({ description: "New message id for this answer" }),
+        answer: Type.String({ description: "Your answer to the parent's question" }),
+      }),
+      async execute(_toolCallId, params, signal) {
+        const { result, exitCode } = await callHost(
+          "answer",
+          params,
+          signal,
+          DEFAULT_REQUEST_TIMEOUT_MS,
+        );
+        if (exitCode !== 0) {
+          throw new Error(
+            `Agent Link answer was not delivered (exit ${exitCode}): ${JSON.stringify(result)}`,
+          );
+        }
+        const replay = result.idempotent === true ? " (idempotent replay, not re-written)" : "";
+        const late = result.late === true ? " late=true" : "";
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Answered parent request ${params.request_id}; ` +
+                `status=${String(result.status)}${late}${replay}.`,
             },
           ],
           details: result,

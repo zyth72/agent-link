@@ -1,13 +1,13 @@
 """Codex desktop parent-side thin CLI.
 
-``python3 -m agent_link.codex`` is the parent helper for a Codex chat.  It
-discovers the bindings registered for the current session in the user-level
-registry, verifies every candidate against the binding's own SQLite database
-opened **read-only**, and only then reuses the core CLI command handlers
-(``agent_link.cli``) for the parent-side operations.  It never accepts a
-``--root`` from the caller: the runtime root and the binding identity must come
-from a registry entry that passed verification, so a root pasted into a chat
-message can never route a parent reply.
+``python3 -m agent_link.hosts.codex.cli`` is the parent helper for a Codex
+chat.  It discovers the bindings registered for the current session in the
+user-level registry, verifies every candidate against the binding's own SQLite
+database opened **read-only**, and only then reuses the core CLI command
+handlers (``agent_link.cli``) for the parent-side operations.  It never accepts
+a ``--root`` from the caller: the runtime root and the binding identity must
+come from a registry entry that passed verification, so a root pasted into a
+chat message can never route a parent reply.
 
 Why the checks: the registry is a discovery index, not the source of truth.
 A stale entry can keep pointing at a deleted root, a rewritten entry can name
@@ -21,11 +21,18 @@ The session id comes from an explicit ``--session-id`` or, when running inside
 the Codex chat, from ``CODEX_THREAD_ID`` / ``CODEX_SESSION_ID``.  No session id
 is hardcoded anywhere.
 
+Besides the core-compatible operations it offers the minimal RPC-child
+commands ``send-child`` (non-blocking parent request), ``child-status``
+(on-demand controller get_state) and ``stop-child``.  They reuse the same
+registry/SQLite ownership verification and the Pi RPC control client.
+
 Examples::
 
-    python3 -m agent_link.codex --session-id CURRENT_THREAD list
-    python3 -m agent_link.codex --session-id CURRENT_THREAD --binding B reply \\
+    python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD list
+    python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding B reply \\
         --request-id R --message-id M --answer 'decision'
+    python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding B \\
+        ask-child --request-id R --message-id M --question Q --timeout 60
 """
 
 from __future__ import annotations
@@ -39,16 +46,23 @@ import sys
 import traceback
 from pathlib import Path
 
-from . import cli
-from .errors import AgentLinkError, NotFoundError, ValidationError
-from .registry import REGISTRY_VERSION, registry_dir
-from .storage import DB_FILENAME, Store, canonical_json, validate_identifier
+from ... import cli
+from ...errors import AgentLinkError, NotFoundError, ValidationError
+from ...hosts.pi import rpc as pi_rpc
+from ...registry import REGISTRY_VERSION, registry_dir
+from ...storage import (
+    DB_FILENAME,
+    Store,
+    canonical_json,
+    require_text,
+    validate_identifier,
+)
 
 #: Only bindings whose parent is the Codex desktop adapter are discovered.
 PARENT_FRAMEWORK = "codex-desktop"
 #: Trusted environment variables a Codex chat provides for the current thread.
 SESSION_ENV_VARS = ("CODEX_THREAD_ID", "CODEX_SESSION_ID")
-#: Parent-side operations; each reuses the exact core CLI handler.
+#: Core parent-side operations; each reuses the exact core CLI handler.
 OPERATION_HANDLERS = {
     "reply": cli.cmd_reply,
     "ask-child": cli.cmd_ask_child,
@@ -314,15 +328,114 @@ def _verify_store_row(row: dict, candidate: dict) -> None:
         )
 
 
+def _cmd_send_child(store: Store, binding: dict, args):
+    """Non-blocking parent request: persist, deliver, do not wait for a model."""
+    request_id = validate_identifier(args.request_id, "request_id")
+    message_id = validate_identifier(args.message_id, "message_id")
+    question = require_text(args.question, "question")
+    timeout = cli.parse_timeout(args.timeout)
+    prepared = store.prepare_parent_ask(binding["binding_id"], request_id, message_id, question, timeout)
+    request = prepared["request"]
+    error = None
+    if prepared["new"]:
+        _, error = cli.dispatch_parent_request(
+            store,
+            binding["binding_id"],
+            {
+                "kind": "ask_child",
+                "request_id": request_id,
+                "message_id": message_id,
+                "question": question,
+                "timeout_seconds": request["timeout_seconds"],
+                "deadline_epoch": request["deadline_epoch"],
+            },
+        )
+    row = store.get_parent_request(binding["binding_id"], request_id)
+    result = {
+        "binding_id": binding["binding_id"],
+        "request_id": request_id,
+        "message_id": message_id,
+        "status": row["status"],
+        "delivery_state": row["delivery_state"],
+        "idempotent": not prepared["new"],
+    }
+    if error:
+        result["error"] = error
+    return result, 0 if row["delivery_state"] == "host_accepted" else 7
+
+
+def _cmd_child_status(store: Store, binding: dict, args):
+    """Read the Pi RPC descriptor and query the controller on demand."""
+    result = {
+        "binding_id": binding["binding_id"],
+        "child_framework": binding["child_framework"],
+        "child_session_id": binding["child_session_id"],
+    }
+    if binding["child_framework"] != "pi":
+        result["controller"] = "unsupported"
+        return result, 0
+    descriptor = pi_rpc.read_descriptor(store.root, binding["binding_id"])
+    if descriptor is None:
+        pending = store.list_parent_requests(binding["binding_id"], pending_only=True)
+        result["controller"] = "absent"
+        result["pending_requests"] = [
+            {"request_id": row["request_id"], "message_id": row["message_id"], "status": row["status"]}
+            for row in pending
+        ]
+        return result, 0
+    descriptor = pi_rpc.validate_descriptor(descriptor, binding)
+    status = pi_rpc.control_request(
+        descriptor, "status", {}, timeout=getattr(args, "timeout", None)
+    )
+    result.update(
+        {
+            "controller": "ready",
+            "endpoint": descriptor.get("endpoint"),
+            "pi_pid": descriptor.get("pi_pid"),
+            "pi_session_id": descriptor.get("pi_session_id"),
+            "status": status,
+        }
+    )
+    return result, 0
+
+
+def _cmd_stop_child(store: Store, binding: dict, args):
+    """Stop the Pi RPC controller after the usual ownership verification."""
+    if binding["child_framework"] != "pi":
+        raise ValidationError(
+            f"stop-child supports a Pi RPC child, not {binding['child_framework']!r}"
+        )
+    descriptor = pi_rpc.read_descriptor(store.root, binding["binding_id"])
+    if descriptor is None:
+        raise NotFoundError(f"no pi-rpc descriptor for binding {binding['binding_id']!r}")
+    descriptor = pi_rpc.validate_descriptor(descriptor, binding)
+    outcome = pi_rpc.control_request(
+        descriptor, "stop", {}, timeout=getattr(args, "timeout", None)
+    )
+    return {
+        "binding_id": binding["binding_id"],
+        "child_framework": "pi",
+        "stopped": True,
+        "controller": outcome,
+    }, 0
+
+
 def _run_operation(args, candidate: dict):
-    """Create the Store only for a verified binding, then reuse the core handler."""
+    """Create the Store only for a verified binding, then run the operation."""
     store = Store(candidate["root"])
     try:
         row = store.get_binding(candidate["binding_id"])
         _verify_store_row(row, candidate)
         namespace = argparse.Namespace(**vars(args))
         namespace.binding = candidate["binding_id"]
-        result, exit_code = OPERATION_HANDLERS[args.command](store, namespace)
+        if args.command == "send-child":
+            result, exit_code = _cmd_send_child(store, row, namespace)
+        elif args.command == "child-status":
+            result, exit_code = _cmd_child_status(store, row, namespace)
+        elif args.command == "stop-child":
+            result, exit_code = _cmd_stop_child(store, row, namespace)
+        else:
+            result, exit_code = OPERATION_HANDLERS[args.command](store, namespace)
     finally:
         store.close()
     result["binding_id"] = candidate["binding_id"]
@@ -356,7 +469,7 @@ def command_list(session_id: str, requested_binding=None):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python3 -m agent_link.codex",
+        prog="python3 -m agent_link.hosts.codex.cli",
         description=(
             "Codex desktop parent helper: discover this chat's bindings from the user-level "
             "registry (read-only database verification) and run parent-side operations. "
@@ -393,6 +506,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--message-id", required=True, dest="message_id")
     p.add_argument("--question", required=True)
     p.add_argument("--timeout", required=True)
+    p = sub.add_parser(
+        "send-child",
+        help="persist and deliver a parent request without waiting for the child's model",
+    )
+    p.add_argument("--binding", default=argparse.SUPPRESS)
+    p.add_argument("--request-id", required=True, dest="request_id")
+    p.add_argument("--message-id", required=True, dest="message_id")
+    p.add_argument("--question", required=True)
+    p.add_argument("--timeout", required=True)
+    p = sub.add_parser("child-status", help="on-demand status of the Pi RPC controller, if any")
+    p.add_argument("--binding", default=argparse.SUPPRESS)
+    p.add_argument("--timeout", type=float, default=pi_rpc.DEFAULT_CLIENT_TIMEOUT_SECONDS)
+    p = sub.add_parser("stop-child", help="stop the Pi RPC controller")
+    p.add_argument("--binding", default=argparse.SUPPRESS)
+    p.add_argument("--timeout", type=float, default=pi_rpc.DEFAULT_CLIENT_TIMEOUT_SECONDS)
     p = sub.add_parser("get-request", help="read a child request's persisted state")
     p.add_argument("--binding", default=argparse.SUPPRESS)
     p.add_argument("--request-id", required=True, dest="request_id")

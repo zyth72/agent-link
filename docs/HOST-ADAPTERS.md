@@ -8,7 +8,7 @@
 agent_link/hosts/
   base.py          # ParentAdapter、ChildAdapter 抽象基类与 HostAdapters
   codex/
-    __init__.py    # get_adapters；兼容导出 CodexHost
+    __init__.py    # get_adapters
     parent.py      # 交互式 Codex 父端，通过桌面桥投递
   pi/
     __init__.py    # get_adapters
@@ -16,11 +16,11 @@ agent_link/hosts/
     child.py       # Pi RPC 子端投递适配
     rpc.py         # 子进程 RPC 控制器
   omp/
-    __init__.py    # get_adapters；兼容导出 OmpHost / 桥辅助函数
+    __init__.py    # get_adapters
     parent.py
     child.py       # 已有 inbox 子端适配
   opencode/
-    __init__.py    # get_adapters；兼容导出 OpenCodeHost
+    __init__.py    # get_adapters
     parent.py
     child.py       # 已有 inbox 子端适配
 ```
@@ -38,12 +38,16 @@ TypeScript 扩展继续在 `extensions/<framework>/`，它们是加载到真实�
 - 通信服务和 SQLite 请求状态属于核心，不移入某个框架目录；后台运行器仍独立管理运行与取消。
 - `host_accepted` 仅表示传输接受，不等于模型已处理。`reply/answer` 与请求状态仍沿用核心规范。
 
-## 兼容性
+## 路径迁移（不保留旧路径）
 
-旧 `agent_link.hosts.codex:CodexHost`、`agent_link.hosts.omp:OmpHost`、`agent_link.hosts.opencode:OpenCodeHost` 导入通过包重导出保持有效。原有文件路径 `omp_notifier.py` 保留兼容入口，避免破坏已绑定的 `notifier_path`。新增统一入口应被服务和子端投递分发实际使用，不只是摆放目录。
+本次为显式破坏性重构：删除旧单文件驱动与转发模块，不提供旧类名重导出、不添加deprecated别名或薄兼容文件。源码、测试、skill、指南和配置示例全部使用新入口。
 
-Codex 子端未实现时 `child=None`。运行器生命周期能力（start/stop/status/steer）不是所有 ChildAdapter 的强制方法，Pi RPC 控制器通过单独能力接口提供；不能因为某个框架不支持 RPC 就认定它不支持子端消息接收。
+父端适配统一由 `get_adapters().parent` 获取，子端由 `.child` 获取。服务支持 `--framework` 按框架选择；自定义驱动若保留 `--driver MODULE:OBJECT` 则仅是可扩展入口，不用于维持旧内置路径。旧 runtime 绑定与全局安装不自动迁移，新功能使用新worktree里的新绑定测试。
+
+Codex 父端 CLI 放在 `agent_link.hosts.codex.cli`；Pi RPC CLI 放在 `agent_link.hosts.pi.rpc`。旧 `agent_link.hosts.codex.cli`、`agent_link.adapter`、`hosts/omp_notifier.py` 不留转发。共享渲染器和文件桥移到中立 shared 模块，其他框架不得依赖Codex/OMP目录实现共享基础功能。TypeScript扩展如需相应整理，只保留一个权威实现，不复制旧入口。
+
+Codex 子端未实现时 `child=None`。生命周期能力（start/stop/status/steer）不是所有 ChildAdapter 的强制方法，Pi RPC 控制器通过单独能力接口提供。入口对象存在不等于进程已连接，需单独检查runtime状态。
 
 ## 验证
 
-验证入口无副作用、两侧基类继承、角色缺失明确报错、旧导入兼容，以及核心投递确实调用入口返回的对象。框架能力需要真实接入或模拟证据分别标注。已有公共接口与其他框架的未提交改动应保留。
+验证入口无副作用、两侧基类继承、角色缺失明确报错、旧导入路径已移除，以及核心投递确实调用入口返回的对象。框架能力需要真实接入或模拟证据分别标注。已有公共接口与其他框架的未提交改动应保留。

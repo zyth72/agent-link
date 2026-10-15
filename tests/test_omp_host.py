@@ -18,7 +18,8 @@ from pathlib import Path
 
 from agent_link.errors import AgentLinkError
 from agent_link.host import HostService, load_driver
-from agent_link.hosts.omp import OmpHost, bridge_path
+from agent_link.hosts.omp.parent import OmpParentAdapter
+from agent_link.shared import parent_bridge_path
 from agent_link.storage import Store
 from tests import isolate_registry
 
@@ -47,8 +48,8 @@ class OmpHostTest(unittest.TestCase):
             )
         finally:
             store.close()
-        self.bridge = bridge_path(self.root, "b")
-        self.service = self.start_service(OmpHost())
+        self.bridge = parent_bridge_path(self.root, "b")
+        self.service = self.start_service(OmpParentAdapter())
 
     # -- helpers -------------------------------------------------------
     def start_service(self, driver):
@@ -91,10 +92,10 @@ class OmpHostTest(unittest.TestCase):
 
     # -- tests ---------------------------------------------------------
     def test_driver_capabilities_and_event_schema(self):
-        driver = load_driver("agent_link.hosts.omp:OmpHost")
+        driver = load_driver("agent_link.hosts.omp.parent:OmpParentAdapter")
         capabilities = driver.capabilities()
         self.assertEqual(capabilities["host"], "omp")
-        self.assertEqual(capabilities["driver"], "agent_link.hosts.omp:OmpHost")
+        self.assertEqual(capabilities["driver"], "agent_link.hosts.omp.parent:OmpParentAdapter")
         self.assertEqual(capabilities["notification_transport"], "session_bridge_file")
         self.assertEqual(capabilities["receive_mode"], "session_injection")
         store = Store(self.root)
@@ -119,7 +120,7 @@ class OmpHostTest(unittest.TestCase):
             )
         finally:
             store.close()
-        self.assertEqual(detail, f"omp_bridge:{self.bridge}#m-r")
+        self.assertEqual(detail, f"omp-bridge:{self.bridge}#m-r")
         report_event, ask_event = self.events()
         self.assertEqual(report_event["v"], 1)
         self.assertEqual(report_event["source"], "service")
@@ -200,29 +201,33 @@ class OmpHostTest(unittest.TestCase):
         self.assertEqual(message["delivery_state"], "failed_or_unknown")
         self.assertIn("omp-bridge", message["delivery_detail"])
 
-    def test_notifier_bridge_cli_path(self):
+    def test_parent_adapter_cli_path_appends_bridge_without_env(self):
+        """The registered OMP parent adapter appends the shared bridge file
+        directly; the old notifier_path/env-based path is gone."""
         config = {
             "binding_id": "cli-b",
             "run_id": "r-cli",
             "native_task_id": None,
             "parent": {"framework": "omp", "session_id": "parent-cli"},
             "child": {"framework": "omp", "session_id": "child-cli"},
-            "notifier_path": str(REPO_ROOT / "agent_link" / "hosts" / "omp_notifier.py"),
+            "notifier_path": str(REPO_ROOT / "agent_link" / "shared.py"),
         }
         config_path = Path(self.temp.name) / "bind-cli.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
         env = dict(os.environ)
         env["PYTHONPATH"] = str(REPO_ROOT)
-        env["AGENT_LINK_BRIDGE_FILE"] = str(bridge_path(self.root, "cli-b"))
-        env["AGENT_LINK_BINDING"] = "cli-b"
+        # Deliberately no AGENT_LINK_BRIDGE_FILE / AGENT_LINK_BINDING: the
+        # adapter resolves the path from the binding's root.
+        env.pop("AGENT_LINK_BRIDGE_FILE", None)
+        env.pop("AGENT_LINK_BINDING", None)
 
-        def run_cli(*args, use_env=None):
+        def run_cli(*args):
             return subprocess.run(
                 [sys.executable, "-m", "agent_link", "--root", str(self.root), *args],
                 capture_output=True,
                 text=True,
                 cwd=str(REPO_ROOT),
-                env=use_env or env,
+                env=env,
                 timeout=30,
             )
 
@@ -230,40 +235,19 @@ class OmpHostTest(unittest.TestCase):
         self.assertEqual(bound.returncode, 0, bound.stderr)
         report = run_cli("report", "--binding", "cli-b", "--message-id", "m-cli", "--text", "hello")
         self.assertEqual(report.returncode, 0, report.stderr)
-        events = self.events(bridge_path(self.root, "cli-b"))
+        events = self.events(parent_bridge_path(self.root, "cli-b"))
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["source"], "notifier")
+        self.assertEqual(events[0]["source"], "service")
         self.assertEqual(events[0]["binding_id"], "cli-b")
         self.assertEqual(events[0]["thread_id"], "parent-cli")
         self.assertEqual(events[0]["parent_framework"], "omp")
         self.assertEqual(events[0]["child_session_id"], "child-cli")
         self.assertIn("[agent-link:report]", events[0]["prompt"])
         self.assertIn("hello", events[0]["prompt"])
-
-        # Missing environment variables are a delivery failure, never a silent
-        # success, and each names the variable that is absent.
-        for missing, message_id in (
-            ("AGENT_LINK_BRIDGE_FILE", "m-no-file"),
-            ("AGENT_LINK_BINDING", "m-no-binding"),
-        ):
-            with self.subTest(missing=missing):
-                broken = dict(env)
-                broken.pop(missing)
-                failed = run_cli(
-                    "report",
-                    "--binding",
-                    "cli-b",
-                    "--message-id",
-                    message_id,
-                    "--text",
-                    "x",
-                    use_env=broken,
-                )
-                self.assertEqual(failed.returncode, 7)
-                payload = json.loads(failed.stdout.strip().splitlines()[-1])
-                self.assertEqual(payload["delivery_state"], "failed_or_unknown")
-                self.assertIn(missing, payload["error"])
-        self.assertEqual(len(events), 1, "failed deliveries must not append events")
+        replay = run_cli("report", "--binding", "cli-b", "--message-id", "m-cli", "--text", "hello")
+        self.assertEqual(replay.returncode, 0)
+        self.assertTrue(json.loads(replay.stdout)["idempotent"])
+        self.assertEqual(len(events), 1, "a replay must not append a second event")
 
 
 if __name__ == "__main__":

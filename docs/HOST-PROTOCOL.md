@@ -126,7 +126,7 @@ AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
 ```json
 {
   "host": "codex-desktop",
-  "driver": "agent_link.hosts.codex:CodexHost",
+  "driver": "agent_link.hosts.codex.parent:CodexParentAdapter",
   "notification_transport": "desktop_bridge",
   "notification_bridge": "binding.notifier_path (background-tasks notifier.py)",
   "receive_mode": "host_injection",
@@ -145,18 +145,18 @@ AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
 
 运行器不是通用宿主协议的强制依赖：其他框架可使用原生后台任务机制。当前 Codex 驱动对通知桥的依赖与上述运行器分工独立。
 
-默认 `agent_link.hosts.codex:CodexHost`：
+默认 `agent_link.hosts.codex.parent:CodexParentAdapter`：
 
 - 只加载 binding 中记录的 `notifier_path`（bind 时固定、校验存在），调用其 `bridge(payload)`；消息内容只作为数据。
 - 本机该路径是 background-tasks 插件的 `notifier.py`（WSL 桌面桥），需要父端桌面环境提供的 `CODEX_APP_TOOLS_PIPE_PATH` 等变量，并在内部调用应用 bundled codex-app-tools 的 send_message_to_thread。
 - 因此：**服务只能在父端环境启动**；子端环境没有这些依赖。
 - 桥返回只记录为 `host_accepted`；模型是否处理必须由父端实际 `reply` 证明。
 
-父端的发现、查询与回复推荐使用 Codex 专用薄 CLI `python3 -m agent_link.codex`：它按本会话 session id 从注册表发现条目，用 SQLite 只读模式校验 root 与归属后才复用核心指令，**不接受消息里的 `--root`**。用法、校验规则与 background-tasks 启动顺序见 [CODEX.md](CODEX.md)。
+父端的发现、查询与回复推荐使用 Codex 专用薄 CLI `python3 -m agent_link.hosts.codex.cli`：它按本会话 session id 从注册表发现条目，用 SQLite 只读模式校验 root 与归属后才复用核心指令，**不接受消息里的 `--root`**。用法、校验规则与 background-tasks 启动顺序见 [CODEX.md](CODEX.md)。
 
 ## 6. 其他宿主：HostDriver 注册方式
 
-`agent_link/hosts/__init__.py` 定义协议：
+内置框架入口由 `agent_link/hosts/base.py` 定义，见 [适配器入口规范](HOST-ADAPTERS.md)。自定义 `--driver` 仍可按以下结构提供对象：
 
 ```python
 class HostDriver(Protocol):
@@ -193,12 +193,12 @@ class HostDriver(Protocol):
 
 ### 6.1 OMP 父端驱动（session_bridge_file）
 
-`agent_link.hosts.omp:OmpHost` 把每条通知追加为一行 JSON 事件到 `<root>/omp-bridge/<binding_id>.jsonl`（flock 独占 + fsync，0600）；父端 OMP 主会话加载 `extensions/omp/agent-link.ts` 轮询该文件并注入会话：
+`agent_link.hosts.omp.parent:OmpParentAdapter` 把每条通知追加为一行 JSON 事件到 `<root>/omp-bridge/<binding_id>.jsonl`（flock 独占 + fsync，0600）；父端 OMP 主会话加载 `extensions/omp/agent-link.ts` 轮询该文件并注入会话：
 
 ```bash
 python3 -m agent_link.host --root /abs/runtime --binding live-001 \
   --credentials /abs/runtime/child-credentials.json \
-  --driver agent_link.hosts.omp:OmpHost
+  --driver agent_link.hosts.omp.parent:OmpParentAdapter
 
 AGENT_LINK_BRIDGE_FILE=/abs/runtime/omp-bridge/live-001.jsonl \
 AGENT_LINK_BINDING=live-001 \
@@ -212,7 +212,7 @@ AGENT_LINK_BINDING=live-001 \
 - 写入失败（如桥目录位置被占用）由驱动抛 `DeliveryFailure`，服务记为 `failed_or_unknown`，不会产生半个事件。
 - 投递为 at-least-once：cursor 落盘前崩溃、或桥文件被整体替换时，已注入事件可能重放；不承诺 exactly-once。
 
-不使用宿主服务时，旧 CLI 也可经 notifier 兼容桥投递同一格式：`notifier_path` 指向 `agent_link/hosts/omp_notifier.py`，运行 CLI 的父端环境必须设置 `AGENT_LINK_BRIDGE_FILE` 与 `AGENT_LINK_BINDING`（缺失则投递失败，CLI exit 7）；`payload.thread_id` 必须是非空字符串。
+旧 `omp_notifier.py` 路径已删除，不提供兼容转发；OMP 接入使用本节通信服务与扩展。
 
 ### 6.2 绑定索引（registry）与父→子通道（inbox）
 
@@ -220,7 +220,7 @@ AGENT_LINK_BINDING=live-001 \
 - 适配器（OMP/Pi watcher）扫描索引，把条目里 `parent.*`/`child.*` 的 framework+session_id 与本会话匹配来自动认领 binding（取 `updated_at` 最新者；显式环境变量优先）。CLI `list-bindings` 提供同一索引的人类/shell 视图（`--parent-session-id` 等过滤）。
 - 父→子通道：CLI `ask-child`/`answer`/`get-parent-request`/`list-parent-requests`，语义与子端 ask/reply 镜像（同内容重放幂等、不同内容冲突、超时/迟到答复 late=true、答复不可覆盖）。宿主服务另有 `/v1/answer`、`/v1/child-requests`、`/v1/get-parent-request`（见 §3.2）。
 - 父端请求经 `<root>/inbox/<binding_id>.jsonl` 唤醒子端会话（同一共享 watcher，child 角色认领）；事件字段同 §6.1，`kind` 为 `ask_child`、`source` 为 `parent-cli`。投递的 `host_accepted` 只表示事件可读，不表示子端已处理；子端是否答复由持久化的 answer 证明。
-- Codex 父端用 `python3 -m agent_link.codex --session-id ... [--binding ...] list|reply|get-request|ask-child|get-parent-request|list-parent-requests` 发现和操作绑定：按 `parent.framework=codex-desktop` 与 `parent.session_id` 过滤注册表，SQLite 只读校验 root/归属/run_id/config_digest 后才接受，不接受消息里的 `--root`；多条匹配必须显式 `--binding`。详见 [CODEX.md](CODEX.md)。
+- Codex 父端用 `python3 -m agent_link.hosts.codex.cli --session-id ... [--binding ...] list|reply|get-request|ask-child|get-parent-request|list-parent-requests` 发现和操作绑定：按 `parent.framework=codex-desktop` 与 `parent.session_id` 过滤注册表，SQLite 只读校验 root/归属/run_id/config_digest 后才接受，不接受消息里的 `--root`；多条匹配必须显式 `--binding`。详见 [CODEX.md](CODEX.md)。
 
 ## 7. 子端扩展工具（Pi / OMP）
 
@@ -238,7 +238,7 @@ AGENT_LINK_BINDING=live-001 \
 - 加载方式（启动步骤见 §2.2）：命令行 `--extension` 显式加载，或放入项目/用户扩展目录，或登记进 `~/.omp/agent/config.yml` 的 `extensions:`；不会自动读取任何父端配置或会话 ID（session id 由扩展从宿主运行时读取，见 §6.2 自动认领）。
 - OMP：`extensions/omp/agent-link.ts` 注册全部五个工具（`pi.zod` schema，带 `loadMode:"essential"`），工具名、文案与语义与 Pi 版同名工具逐字一致。同一文件还充当桥 watcher（共享实现见 `extensions/shared/bridge-watcher.ts`）：显式环境变量优先，否则按注册表自动认领，可同时持有父桥与子端 inbox 两个 watcher。
 - Pi：`extensions/pi/agent-link.ts` 三个子端工具（`Type`/`defineTool`）+ 父端 watcher（同一共享模块；注入按 Pi 语义：空闲 `sendUserMessage` 起一轮，忙碌 `deliverAs:"followUp"` 排队）。
-- OpenCode：`extensions/opencode/agent-link.ts` 是 v2 插件（`{id, setup}`；`ctx.tool.transform` 注册五个子端工具，语义与 OMP 逐字一致；注入用 `ctx.session.prompt({delivery:"queue"})`）；watcher 复用同一共享模块（framework "opencode"，父子两角色；插件是 server 级，会话归属取最近活跃会话，多会话并发时为近似——见文件头注释）。父端驱动 `agent_link.hosts.opencode:OpenCodeHost`（OmpHost 薄子类，同一文件桥）。本机 2.0.29 只接受 v2 插件形态（v1 工厂形态被拒绝）。
+- OpenCode：`extensions/opencode/agent-link.ts` 是 v2 插件（`{id, setup}`；`ctx.tool.transform` 注册五个子端工具，语义与 OMP 逐字一致；注入用 `ctx.session.prompt({delivery:"queue"})`）；watcher 复用同一共享模块（framework "opencode"，父子两角色；插件是 server 级，会话归属取最近活跃会话，多会话并发时为近似——见文件头注释）。父端驱动 `agent_link.hosts.opencode.parent:OpenCodeParentAdapter`（OmpHost 薄子类，同一文件桥）。本机 2.0.29 只接受 v2 插件形态（v1 工厂形态被拒绝）。
 - Codex 子端：尚无适配器与 inbox watcher；`ask-child` 对它不会自动唤醒，不要承诺。Codex 作为父端的发现/回复见 [CODEX.md](CODEX.md)。
 
 ## 8. 测试与已验证 / 未验证

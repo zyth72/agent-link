@@ -24,7 +24,7 @@ from typing import Any
 
 from . import cli
 from .errors import AgentLinkError, NotFoundError, ValidationError
-from .hosts.codex import CodexHost
+from .hosts.base import load_adapters
 from .registry import entry_from_row, write_entry
 from .storage import Store
 
@@ -60,7 +60,12 @@ class HostService(ThreadingHTTPServer):
         self.root = str(root)
         self.binding_id = binding_id
         self.token = token
-        self.driver = CodexHost() if driver is None else driver
+        if driver is None:
+            adapter = load_adapters("codex-desktop").parent
+            if adapter is None:  # pragma: no cover - registered adapter set
+                raise ValidationError("codex-desktop has no parent adapter")
+            driver = adapter
+        self.driver = driver
         for method in ("capabilities", "notify"):
             if not callable(getattr(self.driver, method, None)):
                 raise ValidationError(f"host driver must implement {method}()")
@@ -325,14 +330,28 @@ def main() -> int:
         help="path for the child credentials JSON (created 0600, never overwritten)",
     )
     parser.add_argument(
+        "--framework",
+        default=None,
+        help="registered parent adapter framework (default: codex-desktop)",
+    )
+    parser.add_argument(
         "--driver",
-        default="agent_link.hosts.codex:CodexHost",
-        help="host driver as MODULE:OBJECT (default: Codex desktop bridge)",
+        default=None,
+        help="custom host driver as MODULE:OBJECT (extension point; overrides --framework)",
     )
     args = parser.parse_args()
 
+    if args.driver and args.framework:
+        parser.error("--driver and --framework are mutually exclusive")
+
     try:
-        driver = load_driver(args.driver)
+        if args.driver:
+            driver = load_driver(args.driver)
+        else:
+            adapters = load_adapters(args.framework or "codex-desktop")
+            if adapters.parent is None:
+                parser.error(f"framework {args.framework or 'codex-desktop'!r} has no parent adapter")
+            driver = adapters.parent
         store = Store(args.root)
         try:
             binding_row = store.get_binding(args.binding)

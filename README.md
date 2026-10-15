@@ -12,7 +12,7 @@
 
 v0.1，仓库内 103 个测试全部通过（`python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v`），另有 `node tests/pi/extension_unit.test.mjs` 13 个。
 
-已验证：绑定/幂等/冲突、运行中 `report`、阻塞 `ask` 与父端 `reply` 反向回复、超时与迟到答复、数据库重开恢复、并发写入冲突、通知失败不重投；宿主服务 loopback 协议（超时上限、body/连接限制、统一 JSON 错误、并发/失败/跨 binding/未知字段、重启重放不重投）；Pi 扩展（jiti 加载真实扩展、伪造 ExtensionAPI、真实 HTTP + 模拟父端闭环、`pi --help` 无模型加载验证）；OMP 父/子两条路径（Bun 加载真实扩展、对真实 OmpHost 服务闭环、父端桥六组无模型验收、真实 `omp --mode rpc` 注册三工具、`omp_notifier.py` 兼容桥、真实会话注入实测：空闲会话收到桥事件后启动一轮并由模型实际回答、OMP 子端真实模型端到端：模型实际调用 `report_parent`/`ask_parent` 并收到父端 `reply` 答复（后台任务实测）、绑定注册表与按 session id 自动认领（OMP/Pi watcher）、Codex 父端 helper（注册表发现 + SQLite 只读校验 + reply/ask-child 临时数据库闭环，无模型验收）、父→子通道（ask-child/answer + 子端 inbox 唤醒，全部无模型验收）、Pi 父端 watcher（无模型验收）、OpenCode 适配器（v2 插件注册与五工具、共享 watcher 场景、真实 `opencode serve` 隔离环境注册，均无模型）。
+已验证：绑定/幂等/冲突、运行中 `report`、阻塞 `ask` 与父端 `reply` 反向回复、超时与迟到答复、数据库重开恢复、并发写入冲突、通知失败不重投；宿主服务 loopback 协议（超时上限、body/连接限制、统一 JSON 错误、并发/失败/跨 binding/未知字段、重启重放不重投）；Pi 扩展（jiti 加载真实扩展、伪造 ExtensionAPI、真实 HTTP + 模拟父端闭环、`pi --help` 无模型加载验证）；OMP 父/子两条路径（Bun 加载真实扩展、对真实 OmpHost 服务闭环、父端桥六组无模型验收、真实 `omp --mode rpc` 注册三工具、真实会话注入实测：空闲会话收到桥事件后启动一轮并由模型实际回答、OMP 子端真实模型端到端：模型实际调用 `report_parent`/`ask_parent` 并收到父端 `reply` 答复（后台任务实测）、绑定注册表与按 session id 自动认领（OMP/Pi watcher）、Codex 父端 helper（注册表发现 + SQLite 只读校验 + reply/ask-child 临时数据库闭环，无模型验收）、父→子通道（ask-child/answer + 子端 inbox 唤醒，全部无模型验收）、Pi 父端 watcher（无模型验收）、OpenCode 适配器（v2 插件注册与五工具、共享 watcher 场景、真实 `opencode serve` 隔离环境注册，均无模型）。
 
 仍为未知：父端忙碌时排队、父轮次结束后的唤醒、应用重启后的可靠性、exactly-once 外部投递、新宿主服务的真实桌面通知、Pi 侧的 LLM 端到端工具调用（OMP 侧已实测）、OMP 忙碌会话的注入行为、OpenCode 的 LLM 端到端与忙碌/唤醒细节（v2 插件注册已实测；一次空闲注入唤醒来自意外探测，其余未验）、Codex 子端适配与 Pi 子端 inbox 自动唤醒（未实现）。不要只修改 `framework` 字符串就声称新框架受支持。
 
@@ -62,13 +62,12 @@ export { default } from "/abs/path/to/agent-link/extensions/pi/agent-link.ts";
 agent_link/          # Python 包：CLI、SQLite 状态机、通知适配器、宿主服务与 HostDriver
   host.py            # 父端 binding 级 loopback 服务（python3 -m agent_link.host）
   registry.py        # 用户级绑定索引（~/.agent-link/registry/）：bind/服务写入，适配器按 session id 认领
-  codex.py           # Codex 父端薄 CLI：注册表发现 + 只读校验 + 复用核心 handler（不接受 --root）
-  hosts/codex.py     # Codex 桌面驱动；真实依赖 background-tasks 桌面桥
-  hosts/omp.py       # OMP 驱动：通知追加到 <root>/omp-bridge/<binding>.jsonl
-  hosts/omp_notifier.py  # 旧 CLI notifier 兼容桥（需 AGENT_LINK_BRIDGE_FILE/BINDING）
-  hosts/inbox.py     # 父→子通道：<root>/inbox/<binding>.jsonl（ask-child 写入）
-  hosts/opencode.py  # OpenCode 驱动（OmpHost 薄子类，文件桥复用）
-  adapter.py         # v0.1 兼容导入
+  hosts/base.py     # ParentAdapter、ChildAdapter 与统一入口
+  hosts/codex/      # Codex 父端适配与 cli.py
+  hosts/pi/         # Pi 父子适配与 RPC 控制器
+  hosts/omp/        # OMP 父子适配
+  hosts/opencode/   # OpenCode 父子适配
+  shared.py         # 公共消息渲染与文件桥工具
 extensions/
   shared/agent-link-client.ts            # Pi/OMP/OpenCode 共用的子端 HTTP 客户端
   shared/bridge-watcher.ts               # 桥 watcher 共享实现（锁/cursor/自动认领/保序重试）
@@ -97,7 +96,7 @@ Codex 桌面 + WSL 推荐先安装独立项目 [codex-background-tasks](https://
 
 安装方式、Python 版本与桌面限制以配套仓库说明为准。安装后重新加载 Codex，确认 `run_cli` 可用，再继续下面的绑定与宿主设置。绑定的 `notifier_path` 使用当前安装中的实际路径，不复制其他电脑的用户名或缓存版本。
 
-父端发现、查询与回复推荐使用 `python3 -m agent_link.codex`（按本会话 session id 从注册表发现绑定并只读校验，不接受消息里的 `--root`），完整流程见 [docs/CODEX.md](docs/CODEX.md)。
+父端发现、查询与回复推荐使用 `python3 -m agent_link.hosts.codex.cli`（按本会话 session id 从注册表发现绑定并只读校验，不接受消息里的 `--root`），完整流程见 [docs/CODEX.md](docs/CODEX.md)。
 
 在 Codex 中可以说：“使用 agent-link，通过 background-tasks 启动 Pi，过程中汇报，需要决定时向父 agent 提问。”
 

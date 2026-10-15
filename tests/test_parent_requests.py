@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 
 from agent_link.host import HostService
-from agent_link.hosts.inbox import inbox_path
+from agent_link.shared import inbox_path
 from agent_link.storage import Store
 from tests import isolate_registry
 

@@ -6,6 +6,10 @@
 - 存储为单个 SQLite 数据库，支持多个 CLI 进程并发。
 - v0.1 只支持同一 OS 用户的同机可信场景，不承诺恶意同用户隔离。
 
+## 框架能力与启动
+
+具体框架的启动命令、模型配置、就绪检查、已有会话接入和清理见 [框架接入指南](agent_link/hosts/README.md)。各框架目录 README 区分原生能力与已实现适配能力。
+
 ## 快速开始
 
 ```bash
@@ -154,7 +158,7 @@ OMP（oh-my-pi，Bun 运行时）可同时作为父端与子端；驱动、桥�
 # 父端（必须）：OMP 驱动把通知追加到 <root>/omp-bridge/<binding_id>.jsonl
 python3 -m agent_link.host --root /abs/runtime --binding live-001 \
   --credentials /abs/runtime/child-credentials.json \
-  --driver agent_link.hosts.omp:OmpHost
+  --driver agent_link.hosts.omp.parent:OmpParentAdapter
 
 # 父端主会话：独占桥文件并每秒轮询注入（deliverAs:"aside"、attribution:"agent"）
 AGENT_LINK_BRIDGE_FILE=/abs/runtime/omp-bridge/live-001.jsonl \
@@ -181,25 +185,25 @@ AGENT_LINK_BRIDGE_FILE=/abs/runtime/omp-bridge/live-001.jsonl AGENT_LINK_BINDING
 
 ## OpenCode 父端/子端（可选）
 
-OpenCode 用 v2 插件 `extensions/opencode/agent-link.ts`（本机验证 2.0.29；v1 插件形态会被拒绝加载）：把文件放入 `~/.config/opencode/plugin/` 后每个会话自动加载。子端五个工具与 OMP 同名同语义；watcher 复用共享模块，同样支持注册表自动认领。父端宿主服务用 `--driver agent_link.hosts.opencode:OpenCodeHost`（文件桥与 OMP 相同）。已知限制（server 级多会话归属近似等）见 [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md) §7 与插件文件头注释。
+OpenCode 用 v2 插件 `extensions/opencode/agent-link.ts`（本机验证 2.0.29；v1 插件形态会被拒绝加载）：把文件放入 `~/.config/opencode/plugin/` 后每个会话自动加载。子端五个工具与 OMP 同名同语义；watcher 复用共享模块，同样支持注册表自动认领。父端宿主服务用 `--driver agent_link.hosts.opencode.parent:OpenCodeParentAdapter`（文件桥与 OMP 相同）。已知限制（server 级多会话归属近似等）见 [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md) §7 与插件文件头注释。
 
-## Codex 父端助手（agent_link.codex，推荐）
+## Codex 父端助手（agent_link.hosts.codex.cli，推荐）
 
 Codex 桌面父端不要把消息里的 `--root` 当作回复目标。新 helper 只用用户级注册表（`~/.agent-link/registry/`）发现绑定，并用 SQLite **只读模式**打开 root 下既有数据库，核对 parent 会话归属与 run_id/config_digest 等标识后才接受：
 
 ```bash
 # 会话 id 显式传入，或使用聊天环境里的 CODEX_THREAD_ID / CODEX_SESSION_ID
-python3 -m agent_link.codex --session-id CURRENT_THREAD list
+python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD list
 
 # 多个 binding 必须显式 --binding（不会自动选最新）
-python3 -m agent_link.codex --session-id CURRENT_THREAD --binding BINDING \
+python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BINDING \
   reply --request-id R --message-id M --answer 'A'
 
-python3 -m agent_link.codex --session-id CURRENT_THREAD --binding BINDING \
+python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BINDING \
   ask-child --request-id R --message-id M --question Q --timeout 240
-python3 -m agent_link.codex --session-id CURRENT_THREAD --binding BINDING \
+python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BINDING \
   get-request --request-id R
-python3 -m agent_link.codex --session-id CURRENT_THREAD --binding BINDING \
+python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BINDING \
   list-parent-requests --pending
 ```
 
@@ -232,4 +236,4 @@ python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v
 
 ## Codex 后台运行配套
 
-推荐先安装 [codex-background-tasks](https://github.com/zyth72/codex-background-tasks#安装)（MIT），重载后使用 `run_cli` 启动宿主和 Pi。父端发现、查询与回复推荐使用 `python3 -m agent_link.codex`（见 [docs/CODEX.md](docs/CODEX.md)），不要凭消息里的 root 直接 `reply`。宿主服务单独运行、`notify=false`；Pi 任务 `notify=true`，必须显式 `--extension /abs/repo/extensions/pi/agent-link.ts`，继承父环境并设置子端凭据路径。等待服务凭据就绪再启动 Pi，结束后关闭服务。完整生命周期见 [宿主规范](docs/HOST-PROTOCOL.md#5-codex-驱动的真实依赖)。
+推荐先安装 [codex-background-tasks](https://github.com/zyth72/codex-background-tasks#安装)（MIT），重载后使用 `run_cli` 启动宿主和 Pi。父端发现、查询与回复推荐使用 `python3 -m agent_link.hosts.codex.cli`（见 [docs/CODEX.md](docs/CODEX.md)），不要凭消息里的 root 直接 `reply`。宿主服务单独运行、`notify=false`；Pi 任务 `notify=true`，必须显式 `--extension /abs/repo/extensions/pi/agent-link.ts`，继承父环境并设置子端凭据路径。等待服务凭据就绪再启动 Pi，结束后关闭服务。完整生命周期见 [宿主规范](docs/HOST-PROTOCOL.md#5-codex-驱动的真实依赖)。

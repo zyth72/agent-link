@@ -22,10 +22,10 @@
 | --- | --- | --- |
 | 跨框架协作层 | Cross-framework Collaboration Layer | Agent Link 项目的定位：统一绑定、汇报、决策请求与答复，不接管所有框架的生命周期。 |
 | 后台运行器 | Task Runner | 启动、查询、取消后台执行，管理执行超时与退出；Codex 当前使用 background-tasks，其他框架可用原生机制。TaskRunner 是架构角色，当前 Agent Link 没有同名通用接口。 |
-| 父端宿主适配器 | Host Adapter | 将通知投递到父会话并声明宿主能力；代码接口 HostDriver，Codex 实现 CodexHost。不把整个框架称为适配器。 |
+| 父端宿主适配器 | Host Adapter | 将通知投递到父会话并声明宿主能力；代码接口 ParentAdapter，Codex 实现 CodexParentAdapter。不把整个框架称为适配器。 |
 | 子端适配器 | Child Adapter | 把通信操作暴露为子 agent 可调用的工具；当前为 Pi 扩展 extensions/pi/agent-link.ts 与 OMP 扩展 extensions/omp/agent-link.ts（两个文件都同时承担父端 watcher；OMP 版另有子端 inbox watcher 与答复工具；watcher 本体共享 extensions/shared/bridge-watcher.ts）。 |
 | 通信服务 | Link Service | 为子端提供认证、绑定范围内的通信入口及请求状态；当前入口 python3 -m agent_link.host，类 HostService。 |
-| 通知桥 | Notification Bridge | 连接具体宿主接口的投递实现；Codex 当前使用 background-tasks 中的 notifier.py / app_bridge.mjs；OMP 使用 OmpHost 驱动或 omp_notifier.py 写桥接文件。 |
+| 通知桥 | Notification Bridge | 连接具体宿主接口的投递实现；Codex 当前使用 background-tasks 中的 notifier.py / app_bridge.mjs；OMP 使用 OmpParentAdapter 写桥接文件。 |
 | 桥接文件 | Bridge File | OMP 父端通知落盘的 JSONL 文件（`<root>/omp-bridge/<binding_id>.jsonl`）；由适配器 watcher 以单消费者锁轮询并注入，不是消息队列，不承诺 exactly-once（at-least-once）。 |
 | 绑定索引 / 注册表 | Binding Registry | 用户级发现索引（`~/.agent-link/registry/`，`AGENT_LINK_REGISTRY` 可覆盖）：bind 与宿主服务写入绑定条目，父/子端适配器按本会话 id 自动认领绑定；只是发现指针，权威记录仍是各 runtime root 的 SQLite。 |
 | 收件箱文件 | Inbox File | 父→子通道事件落盘的 JSONL（`<root>/inbox/<binding_id>.jsonl`）；由子端 watcher 注入子会话，同样 at-least-once。 |
