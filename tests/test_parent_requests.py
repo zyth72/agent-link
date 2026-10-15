@@ -30,7 +30,8 @@ class StubDriver:
 
 
 class ParentChildCliCase(unittest.TestCase):
-    """CLI closed loop: parent ask-child writes the inbox; child answers via CLI."""
+    """CLI closed loop for the legacy inbox child (OpenCode): ask-child writes
+    the inbox; the child answers via the ordinary CLI."""
 
     def setUp(self):
         isolate_registry(self)
@@ -45,7 +46,7 @@ class ParentChildCliCase(unittest.TestCase):
             "run_id": "r-pc",
             "native_task_id": None,
             "parent": {"framework": "omp", "session_id": "parent-1"},
-            "child": {"framework": "omp", "session_id": "child-1"},
+            "child": {"framework": "opencode", "session_id": "child-1"},
             "notifier_path": str(self.notifier),
         }
         config_path = Path(self.tmp.name) / "bind.json"
@@ -134,7 +135,7 @@ class ParentChildCliCase(unittest.TestCase):
         self.assertEqual(event["binding_id"], self.binding)
         self.assertEqual(event["source"], "parent-cli")
         self.assertEqual(event["parent_session_id"], "parent-1")
-        self.assertEqual(event["child_framework"], "omp")
+        self.assertEqual(event["child_framework"], "opencode")
         self.assertEqual(event["child_session_id"], "child-1")
         self.assertEqual(event["request_id"], "rq-1")
         self.assertEqual(event["message_id"], "pm-1")

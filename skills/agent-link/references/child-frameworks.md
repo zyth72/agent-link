@@ -4,8 +4,8 @@
 
 | 框架 | 当前接入 | 父→子唤醒 |
 | --- | --- | --- |
-| Pi | 原生 report/ask/check/answer 工具 + 专用 RPC 控制器 | descriptor ready 时 RPC prompt，已通过真实模型空闲唤醒；无 descriptor 的 inbox 不唤醒 Pi |
-| OMP | 扩展工具 + 文件桥/收件箱 watcher | 现有 watcher；无轮询 HTTP 推送仅有临时探针验证 |
+| Pi | 原生 report/ask/check/answer 工具 + 专用 RPC 控制器 | descriptor ready 时 RPC prompt，已通过真实模型空闲唤醒；无 descriptor 时走 session HTTP，无接口明确失败 |
+| OMP | 扩展工具 + session HTTP 主动推送 | 原生 aside 注入，无文件轮询 |
 | OpenCode v2 | 插件工具 + 文件桥/收件箱 watcher | 当前 watcher；原生 steer/queue/interrupt 尚未接入统一控制接口 |
 | Codex | 仅父端适配 | child=None，不支持子端唤醒 |
 

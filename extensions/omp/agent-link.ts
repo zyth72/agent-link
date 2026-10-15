@@ -1,32 +1,7 @@
-/**
- * Agent Link adapter for OMP (oh-my-pi).
- *
- * Two roles share this one extension:
- *
- * Child tools -- with an AGENT_LINK_CREDENTIALS file from the parent host
- * service, report_parent / ask_parent / check_parent_request behave exactly
- * like the Pi extension's tools (same names, labels, texts and semantics);
- * answer_parent / poll_parent_requests serve parent-initiated requests
- * (ask_child).  They cannot choose a parent session, create bindings or reply
- * to their own requests.
- *
- * Bridge watchers -- with AGENT_LINK_BRIDGE_FILE + AGENT_LINK_BINDING set, the
- * main session consumes that parent bridge file explicitly.  Without them, the
- * session auto-claims from the user-level registry (~/.agent-link/registry/,
- * override AGENT_LINK_REGISTRY): a binding whose parent.session_id matches this
- * session makes it watch <root>/omp-bridge/<binding>.jsonl (child->parent), and
- * a binding whose child.session_id matches makes it watch
- * <root>/inbox/<binding>.jsonl (parent->child); a session may hold both at
- * once.  Validated events are injected with pi.sendUserMessage
- * (deliverAs:"aside", attribution:"agent").  Per-file single-consumer lock
- * (<file>.lock) and persisted cursor (<file>.cursor, with file identity) apply
- * to each watched file; the watcher itself is shared with the Pi adapter in
- * extensions/shared/bridge-watcher.ts.
- *
- * Delivery is at-least-once: an event is replayed if the process dies after
- * injection but before the cursor is persisted, and a wholesale replacement of
- * the bridge file replays it from the start.  An event whose injection keeps
- * failing blocks later events until it succeeds so the order is preserved.
+/** Agent Link tools and session-owned authenticated HTTP push listener.
+ * No bridge-file polling. Starts on session_start, closes on session_shutdown.
+ * AGENT_LINK_SESSIONS controls private descriptor discovery (default ~/.agent-link/sessions).
+ * Acceptance proves framework injection only, not model processing.
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import {
@@ -35,53 +10,10 @@ import {
   asText,
   callHost,
 } from "../shared/agent-link-client";
-import {
-  startBridgeWatchers,
-  stopBridgeWatchers,
-  type BridgeHost,
-} from "../shared/bridge-watcher";
-
-/** The ctx surface the bridge watchers need; satisfied by ExtensionContext. */
-type BridgeContext = {
-  agent?: { kind?: string };
-  setInterval(callback: () => void, ms: number): unknown;
-  clearTimer(handle: unknown): void;
-  ui: { notify(message: string, level: string): void };
-  sessionManager?: { getSessionId?: () => string | undefined };
-};
-
-function logError(pi: ExtensionAPI, message: string): void {
-  try {
-    pi.logger?.error?.(message);
-  } catch {
-    // Logging must never break the watcher.
-  }
-}
+import { startSessionPush, type PushListener } from "../shared/session-push";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
-}
-
-/** Host-specific behavior for the shared bridge watcher (shared/bridge-watcher.ts). */
-function bridgeHost(pi: ExtensionAPI, ctx: BridgeContext): BridgeHost<BridgeContext> {
-  return {
-    framework: "omp",
-    roles: ["parent", "child"],
-    isMain: (context) => context.agent?.kind === "main",
-    sessionId: (context) => context.sessionManager?.getSessionId?.(),
-    setTimer: (context, callback, ms) => context.setInterval(callback, ms),
-    clearTimer: (context, handle) => context.clearTimer(handle),
-    inject: (_context, prompt) =>
-      pi.sendUserMessage(prompt, { deliverAs: "aside", attribution: "agent" }),
-    notify: (context, message, level) => {
-      try {
-        context.ui.notify(message, level);
-      } catch {
-        // Notifying is best-effort.
-      }
-    },
-    logError: (message) => logError(pi, message),
-  };
 }
 
 export default function agentLinkExtension(pi: ExtensionAPI) {
@@ -320,13 +252,27 @@ export default function agentLinkExtension(pi: ExtensionAPI) {
     },
   });
 
+  // State belongs to this extension instance, never shared across OMP children.
+  let listener: PushListener | undefined;
+  let lifecycle = Promise.resolve();
   pi.on("session_start", (_event, ctx) => {
-    void startBridgeWatchers(bridgeHost(pi, ctx as BridgeContext), ctx as BridgeContext);
+    lifecycle = lifecycle.catch(() => {}).then(async () => {
+      await listener?.close();
+      listener = undefined;
+      const sessionId = ctx.sessionManager.getSessionId();
+      listener = await startSessionPush({
+        framework: "omp", sessionId,
+        inject: (prompt) => {
+          return pi.sendUserMessage(prompt, { deliverAs: "aside", attribution: "agent" });
+        },
+      });
+    });
+    return lifecycle;
   });
-
-  pi.on("session_shutdown", (_event, ctx) => {
-    if ((ctx as BridgeContext).agent?.kind === "main") {
-      void stopBridgeWatchers();
-    }
+  pi.on("session_shutdown", () => {
+    lifecycle = lifecycle.catch(() => {}).then(async () => {
+      await listener?.close(); listener = undefined;
+    });
+    return lifecycle;
   });
 }

@@ -70,7 +70,11 @@ class AdapterEntryCase(unittest.TestCase):
                 if has_child:
                     self.assertIsInstance(adapters.child, ChildAdapter)
                     self.assertEqual(adapters.child.framework, framework)
-                    self.assertIn("driver", adapters.child.capabilities())
+                    # Every child declares its delivery transport; a driver
+                    # pointer is optional because the transport helper is the
+                    # stable contract.
+                    child = adapters.child.capabilities()
+                    self.assertTrue({"driver", "delivery_transport"} & set(child))
                 else:
                     self.assertIsNone(adapters.child)
 
@@ -91,12 +95,20 @@ class AdapterEntryCase(unittest.TestCase):
 
     def test_capabilities_keep_unverified_unknown(self):
         omp_child = omp.get_adapters().child
-        self.assertEqual(omp_child.capabilities()["wake_child"], "watcher_polling")
+        omp_capabilities = omp_child.capabilities()
+        self.assertEqual(omp_capabilities["delivery_transport"], "session_push_http")
+        self.assertEqual(omp_capabilities["wake_child"], "native_injection")
+        self.assertFalse(omp_capabilities["polling"])
+        omp_parent = omp.get_adapters().parent
+        self.assertEqual(omp_parent.capabilities()["notification_transport"], "session_push_http")
+        pi_parent = pi.get_adapters().parent
+        self.assertEqual(pi_parent.capabilities()["notification_transport"], "session_push_http")
+        self.assertEqual(pi_parent.capabilities()["busy_behavior"], "followup_queue")
         pi_child = pi.get_adapters().child
         capabilities = pi_child.capabilities()
-        self.assertEqual(capabilities["delivery_transport"], "rpc_prompt")
-        self.assertEqual(capabilities["wake_child"], "rpc_stdin")
-        self.assertIn("legacy_without_descriptor", capabilities)
+        self.assertEqual(capabilities["delivery_transport"], "rpc_or_session_push")
+        self.assertEqual(capabilities["wake_child"], "native_injection")
+        self.assertFalse(capabilities["polling"])
         codex_parent = codex.get_adapters().parent
         self.assertEqual(codex_parent.capabilities()["busy_behavior"], "unknown")
         self.assertEqual(codex_parent.capabilities()["wake_after_turn"], "unknown")

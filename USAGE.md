@@ -47,7 +47,7 @@ python3 -m agent_link --root /abs/runtime get-request \
 | `ask ...` | 先持久化请求，再通知父端，然后阻塞等待答复 | 0 / 3 / 4 / 5 / 7 |
 | `reply ...` | 关联已存在请求写入答复；不允许覆盖 | 0 / 4 / 5 / 6 |
 | `get-request ...` | 返回请求状态与答复 | 0 / 5 / 6 |
-| `ask-child ...` | 父端请求子端答复并阻塞等待（写入子端 inbox `<root>/inbox/<binding>.jsonl`） | 0 / 3 / 4 / 5 / 6 / 7 |
+| `ask-child ...` | 父端请求子端答复并阻塞等待（按框架使用 Pi RPC、session HTTP 或 OpenCode inbox） | 0 / 3 / 4 / 5 / 6 / 7 |
 | `answer ...` | 子端答复父端请求；不允许覆盖 | 0 / 4 / 5 / 6 |
 | `get-parent-request ...` | 返回父端请求状态与答复 | 0 / 5 / 6 |
 | `list-parent-requests --binding ID [--pending]` | 列出父端请求 | 0 / 6 |
@@ -152,36 +152,17 @@ AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
 
 ## OMP 父端/子端（可选）
 
-OMP（oh-my-pi，Bun 运行时）可同时作为父端与子端；驱动、桥文件格式与验收范围见 [docs/HOST-PROTOCOL.md §6.1](docs/HOST-PROTOCOL.md#61-omp-父端驱动session_bridge_file)。
+OMP 可同时作为父端与子端；两侧均使用 session HTTP 主动推送，无需桥文件或定时扫描。完整命令与模型配置见 [OMP README](agent_link/hosts/omp/README.md)，协议见 [SESSION-PUSH](docs/SESSION-PUSH.md)。
 
 ```bash
-# 父端（必须）：OMP 驱动把通知追加到 <root>/omp-bridge/<binding_id>.jsonl
+export AGENT_LINK_SESSIONS=/abs/private/session-connections
+omp --extension /abs/repo/extensions/omp/agent-link.ts
+# 使用实际 session id 创建 binding，再由父端运行器启动：
 python3 -m agent_link.host --root /abs/runtime --binding live-001 \
-  --credentials /abs/runtime/child-credentials.json \
-  --driver agent_link.hosts.omp.parent:OmpParentAdapter
-
-# 父端主会话：独占桥文件并每秒轮询注入（deliverAs:"aside"、attribution:"agent"）
-AGENT_LINK_BRIDGE_FILE=/abs/runtime/omp-bridge/live-001.jsonl \
-AGENT_LINK_BINDING=live-001 \
-  omp --no-extensions --extension /abs/repo/extensions/omp/agent-link.ts
-
-# 子端（OMP）：仍只需凭据文件；工具与 Pi 版同名同语义
-AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
-  omp --no-extensions --extension /abs/repo/extensions/omp/agent-link.ts '<任务>'
+  --credentials /abs/runtime/child-credentials.json --framework omp
 ```
 
-- 扩展安装：把 `/abs/repo/extensions/omp/agent-link.ts` 登记进 `~/.omp/agent/config.yml` 的 `extensions:`（每个新会话自动加载）或每次 `--extension` 显式加载；扩展只在会话启动时加载，运行中无法补挂，且须保持 `extensions/` 目录完整（依赖 `shared/agent-link-client.ts`）。
-- 自动认领（推荐）：不设两个桥环境变量时，watcher 按本会话 id 从注册表（`~/.agent-link/registry/`，由 `bind` 与宿主服务写入）自动认领 binding——`parent.session_id` 匹配本会话则消费父桥，`child.session_id` 匹配则消费子端 inbox（可同时持有）；绑定在会话启动后创建也会被约 2s 的重扫发现。显式环境变量始终优先。
-- 父→子通道：父端 `ask-child` 写 `<root>/inbox/<binding>.jsonl` 唤醒子端；OMP 子端用 `answer_parent`/`poll_parent_requests` 工具答复（Pi 子端暂用 CLI `answer`）。
-- `<bridge>.lock`（单消费者锁）与 `<bridge>.cursor`（断点，含文件身份 dev/ino）由扩展自动维护：第二个消费者被拒绝，持有进程死亡后锁被回收一次，重启从断点续传并识别文件替换/截断。
-- 注入失败的事件保序阻塞其后事件直到重试成功；超长/非法事件记日志跳过；投递为 at-least-once，不承诺 exactly-once。
-- 不用宿主服务时，旧 CLI 路径把绑定里的 `notifier_path` 指向 `agent_link/hosts/omp_notifier.py`，并在运行 CLI 的环境设置两个变量（缺任一无则 exit 7，投递记 `failed_or_unknown`）：
-
-```bash
-AGENT_LINK_BRIDGE_FILE=/abs/runtime/omp-bridge/live-001.jsonl AGENT_LINK_BINDING=live-001 \
-  python3 -m agent_link --root /abs/runtime report \
-  --binding live-001 --message-id progress-001 --text "实现完成 60%"
-```
+子端启动时额外设置 AGENT_LINK_CREDENTIALS；发送方与接收方使用同一连接目录。session_start 注册、session_shutdown 清理，已在线会话在创建 Binding 后立即可投递，无注册表重扫。认证/会话不匹配、缺连接或失效时明确失败，无文件回退或自动重投。ask-child 的答复使用 answer_parent；HTTP 接受不证明模型处理。
 
 ## OpenCode 父端/子端（可选）
 
@@ -210,7 +191,7 @@ python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BIND
 - 支持 `list`、`reply`、`ask-child`、`get-request`、`get-parent-request`、`list-parent-requests`；参数与核心 CLI 同名，复用同一 handler，JSON 与退出码不变。
 - **不接受 `--root`**；坏条目/缺 root/缺数据库在 `list` 中作为 `rejected` 带原因返回，不自动建库，也不会把消息里的 root 当成执行目标。
 - 仅当恰好一个候选通过校验时才能省略 `--binding`；多条匹配必须显式选择。
-- `ask-child` 阻塞；长等待放进 background-tasks 后台任务。能否唤醒子端取决于子端适配器（OMP/OpenCode 有 inbox watcher；Pi/Codex 子端暂无自动 inbox 注入）。
+- `ask-child` 阻塞；长等待放进 background-tasks 后台任务。能否唤醒子端取决于子端适配器（Pi 使用 RPC 或 session HTTP；OMP 使用 session HTTP；OpenCode 保留 inbox watcher；Codex 子端未实现）。
 - wrapper：`python3 /abs/repo/skills/agent-link/scripts/link.py --codex --session-id CURRENT_THREAD list` 可从任意 cwd 调用；独立安装副本用脚本旁的 `repo-location.json` 定位仓库。
 
 完整流程、校验规则与宿主服务启动步骤见 [docs/CODEX.md](docs/CODEX.md)。
@@ -222,7 +203,7 @@ cd /path/to/agent-intercom-workspace
 python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v
 ```
 
-测试使用模拟 notifier/driver（不发真实桌面消息）；Pi 扩展测试用 jiti 加载真实扩展、以真实 `agent_link.host` + notifier stub（走旧 CLI reply）做 loopback 闭环，并用 `pi --help` 探针扩展验证 Pi 真实加载（不调用模型）。OMP 扩展测试用 Bun 加载真实扩展：对真实 `agent_link.host` + OmpHost 闭环，父端桥六组无模型验收（重启恢复、失败保序、双消费者、会话切换、替换/截断、超长/非法事件），并用 `omp --mode rpc` 的 `dumpTools` 验证真实注册。覆盖：绑定不可重定向、ID 校验、幂等/冲突、重复回复保护、未知请求、超时与迟到回复、数据库重开恢复、两个独立进程并发冲突、模拟 notifier 失败后不重投；复审补充：慢通知不缩短真实截止时间、跨请求复用回复消息 ID 冲突（含并发）、timeout 变更冲突与非法 timeout 拒绝、deadline 边界（>=）与墙钟回拨下的 `late` 判定；宿主服务：认证/统一 JSON 错误/未知字段/方法/路径、body 与 timeout 上限、并发同消息单次投递、驱动失败不重投、跨 binding 隔离、服务重启重放不重投、请求体读超时 408、凭据不覆盖与只删自己的。
+自动测试不调用模型或改真实 Codex 配置。核心覆盖状态、幂等、冲突、超时与迟到答复；Pi/OMP 推送覆盖本地 HTTP 认证、身份校验、上限、错误、生命周期与注入；OpenCode 文件 watcher 另有覆盖。真实模型验收单独记录在 [SESSION-PUSH](docs/SESSION-PUSH.md) 与 [PI-RPC](docs/PI-RPC.md)，不把模拟上下文当作模型行为证据。
 
 ## 已知限制
 

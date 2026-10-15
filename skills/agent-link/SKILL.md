@@ -24,7 +24,7 @@ python3 LINK --codex --session-id CURRENT_THREAD --binding BINDING list-parent-r
 - `list` 只取注册表中 `parent.framework=codex-desktop` 且 `parent.session_id` 等于本会话的条目，并对每个条目的 root 下既有 SQLite 做**只读**校验（父会话归属、run_id、config_digest、child 标识）。坏条目/缺 root/缺数据库以 `rejected` + 原因列出，绝不自动建库。
 - helper **不接受 `--root`**：root 只能来自通过校验的注册表条目。不自动选最新；多条匹配必须显式 `--binding`。
 - 子端 `ask` 的答复用 `reply`（状态 `replied`）；父端 `ask-child` 的答复由子端 `answer`（状态 `answered`）。两者不可混用。
-- `ask-child` 阻塞；长等待放进 background-tasks 后台任务。OMP/OpenCode 仍使用 inbox watcher；Pi 子端推荐专用 RPC 控制器，收到问题后用 answer_parent 答复，无需 inbox 轮询。
+- `ask-child` 阻塞；长等待放进 background-tasks 后台任务。OpenCode 仍使用 inbox watcher；OMP 使用 session HTTP 主动推送；Pi 子端推荐专用 RPC 控制器，收到问题后用 answer_parent 答复，无需 inbox 轮询。
 - `host_accepted` 只表示事件可读；是否处理由持久化答复证明。ask-child 超时 exit 3，迟到答复仍可查询（`late=true`）。
 
 校验细节、退出码与错误 JSON 见 [references/codex-parent.md](references/codex-parent.md)。
@@ -66,7 +66,7 @@ PI_BIN -p --session-id CHILD_SESSION_ID --extension ABS_REPO/extensions/pi/agent
 python3 LINK --pi-rpc --root ABS_RUNTIME --binding BINDING serve --pi-bin ABS_PI --cwd ABS_WORK --credentials ABS_RUNTIME/child-credentials.json --extension ABS_REPO/extensions/pi/agent-link.ts --provider deepseek --model deepseek-flash
 ```
 
-确认 ready 与 session 身份握手后，用 `--pi-rpc ... send --mode prompt --text-file ABS_BRIEF` 开始任务。`send --mode steer|follow-up` 分别介入当前运行或排队；`abort` 当前会清空队列再中断，`stop` 才关闭子端。未配置的模型标识不要直接套用示例。完整启动、清理和能力限制读 `ABS_REPO/agent_link/hosts/pi/README.md`。Pi/OMP 父端无轮询推送目前只有临时探针通过，正式扩展仍是文件 watcher。
+确认 ready 与 session 身份握手后，用 `--pi-rpc ... send --mode prompt --text-file ABS_BRIEF` 开始任务。`send --mode steer|follow-up` 分别介入当前运行或排队；`abort` 当前会清空队列再中断，`stop` 才关闭子端。未配置的模型标识不要直接套用示例。完整启动、清理和能力限制读 `ABS_REPO/agent_link/hosts/pi/README.md`。Pi/OMP 父端使用 session HTTP 主动推送，启动与登记读 ABS_REPO/docs/SESSION-PUSH.md。
 
 ## 通知处理与子端通信
 

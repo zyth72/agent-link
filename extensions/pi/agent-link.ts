@@ -1,31 +1,7 @@
-/**
- * Agent Link adapter for Pi.
- *
- * Two roles share this one extension:
- *
- * Child tools -- when the parent host service wrote an AGENT_LINK_CREDENTIALS
- * file, report_parent / ask_parent / check_parent_request / answer_parent
- * behave exactly like the OMP extension's tools (same names, labels, texts and
- * semantics).  They cannot choose a parent session, create bindings or reply to
- * child-initiated asks.  answer_parent resolves a parent-initiated ask_child
- * request; there is no polling: the RPC prompt carries the request_id and the
- * model answers it directly.
- * See docs/HOST-PROTOCOL.md and docs/PI-RPC.md.
- *
- * Parent bridge watcher -- when AGENT_LINK_BRIDGE_FILE and AGENT_LINK_BINDING
- * are set, the session consumes that bridge file explicitly.  Without them the
- * watcher auto-claims the newest registry entry (AGENT_LINK_REGISTRY, default
- * ~/.agent-link/registry/) whose parent names this Pi session id, consuming
- * <root>/omp-bridge/<binding>.jsonl and pinning event.thread_id to this
- * session id.  The watcher itself (single-consumer lock, persisted cursor with
- * file identity, replace/truncate detection, order-preserving retry) is shared
- * with the OMP adapter in extensions/shared/bridge-watcher.ts.
- *
- * Injection follows Pi's semantics: an idle session gets a plain
- * pi.sendUserMessage (starting a turn); a busy session gets
- * deliverAs:"followUp" so the event queues instead of interrupting the
- * current turn.  Delivery is at-least-once: an event whose injection keeps
- * failing blocks later events until it succeeds so the order is preserved.
+/** Agent Link tools and session-owned authenticated HTTP push listener.
+ * No bridge-file polling. Starts on session_start, closes on session_shutdown.
+ * AGENT_LINK_SESSIONS controls private descriptor discovery (default ~/.agent-link/sessions).
+ * Acceptance proves framework injection only, not model processing.
  */
 import { Type } from "@earendil-works/pi-ai";
 import {
@@ -39,60 +15,7 @@ import {
   asText,
   callHost,
 } from "../shared/agent-link-client";
-import {
-  startBridgeWatchers,
-  stopBridgeWatchers,
-  type BridgeHost,
-} from "../shared/bridge-watcher";
-
-/** The ctx surface the parent watcher needs; satisfied by ExtensionContext. */
-type BridgeContext = Pick<ExtensionContext, "isIdle" | "ui" | "sessionManager">;
-
-function logError(pi: ExtensionAPI, message: string): void {
-  try {
-    // Pi's ExtensionAPI exposes no logger; use one only if the host provides it.
-    if (!("logger" in pi)) return;
-    const logger = pi.logger;
-    if (!logger || typeof logger !== "object" || !("error" in logger)) return;
-    const error = logger.error;
-    if (typeof error !== "function") return;
-    error.call(logger, message);
-  } catch {
-    // Logging must never break the watcher.
-  }
-}
-
-/** Host-specific behavior for the shared bridge watcher (shared/bridge-watcher.ts). */
-function bridgeHost(pi: ExtensionAPI, ctx: BridgeContext): BridgeHost<BridgeContext> {
-  return {
-    framework: "pi",
-    roles: ["parent"],
-    // Pi sessions are not sub-sessions here; module state keeps one watcher
-    // per role per process regardless.
-    isMain: () => true,
-    sessionId: (context) => context.sessionManager.getSessionId(),
-    setTimer: (_context, callback, ms) => setInterval(callback, ms),
-    // The handle comes from the global setInterval above (this host owns the timer).
-    clearTimer: (_context, handle) => clearInterval(handle as NodeJS.Timeout),
-    inject: (context, prompt) => {
-      // An idle session starts a turn; a busy session queues the event instead
-      // of interrupting the current turn (deliverAs is required when busy).
-      if (context.isIdle()) {
-        pi.sendUserMessage(prompt);
-      } else {
-        pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-      }
-    },
-    notify: (context, message, level) => {
-      try {
-        context.ui.notify(message, level);
-      } catch {
-        // Notifying is best-effort.
-      }
-    },
-    logError: (message) => logError(pi, message),
-  };
-}
+import { startSessionPush, type PushListener } from "../shared/session-push";
 
 export default function (pi: ExtensionAPI) {
   pi.registerTool(
@@ -271,11 +194,28 @@ export default function (pi: ExtensionAPI) {
     }),
   );
 
+  // State belongs to this extension instance, never shared across OMP children.
+  let listener: PushListener | undefined;
+  let lifecycle = Promise.resolve();
   pi.on("session_start", (_event, ctx) => {
-    void startBridgeWatchers(bridgeHost(pi, ctx), ctx);
+    lifecycle = lifecycle.catch(() => {}).then(async () => {
+      await listener?.close();
+      listener = undefined;
+      const sessionId = ctx.sessionManager.getSessionId();
+      listener = await startSessionPush({
+        framework: "pi", sessionId,
+        inject: (prompt) => {
+          if (ctx.isIdle()) pi.sendUserMessage(prompt);
+          else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+        },
+      });
+    });
+    return lifecycle;
   });
-
   pi.on("session_shutdown", () => {
-    void stopBridgeWatchers();
+    lifecycle = lifecycle.catch(() => {}).then(async () => {
+      await listener?.close(); listener = undefined;
+    });
+    return lifecycle;
   });
 }

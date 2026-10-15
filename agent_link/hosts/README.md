@@ -16,7 +16,7 @@ Agent Link 是跨 Agent 框架的小工具集合，提供通信工具，并管�
 | --- | --- | --- | --- |
 | Codex Desktop | 有 | 无，`child=None` | [Codex](codex/README.md) |
 | Pi | 有 | 有，专用 RPC 控制器 | [Pi](pi/README.md) |
-| OMP | 有 | 有，扩展与文件收件箱 | [OMP](omp/README.md) |
+| OMP | 有 | 有，session HTTP 主动推送 | [OMP](omp/README.md) |
 | OpenCode | 有 | 有，插件与文件收件箱 | [OpenCode](opencode/README.md) |
 
 框架原生能力、适配器已实现能力、当前进程是否连接分别判断。入口 `get_adapters()` 返回对象不代表进程已经启动；操作成功也不代表模型已处理。
@@ -68,3 +68,5 @@ PYCODE
 静态能力不是健康检查，也不是已完成统一能力 schema 的承诺。先检查宿主 ready/控制器握手，再做 report/ask/reply 或 ask-child/answer 闭环；分别记录模拟测试、真实接口测试、模型端到端测试。未验证行为保留 unknown。单纯启动、查询能力不需要模型；发送任务并让 agent 执行会使用模型额度。
 
 规范见 [适配器入口](../../docs/HOST-ADAPTERS.md)、[核心规范](../../SPEC.md)、[宿主协议](../../docs/HOST-PROTOCOL.md)。
+
+Pi/OMP 无轮询通知的启动、认证与会话登记见 [SESSION-PUSH](../../docs/SESSION-PUSH.md)。

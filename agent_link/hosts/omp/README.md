@@ -1,31 +1,27 @@
 # OMP 接入：能力与启动
 
-入口 `get_adapters()` 提供父端和子端。当前使用扩展 + 文件桥/收件箱 watcher；尚未提供统一 steer、queue、interrupt 控制接口，不能从 OMP 原生能力推断适配器已支持。
+入口 get_adapters() 提供父端和子端。两侧使用 session HTTP 主动推送，不再读桥接文件或 inbox，不依赖轮询。框架注入使用 sendUserMessage(deliverAs=aside, attribution=agent)。统一 steer/queue/interrupt 控制仍未接入，不由 aside 推断其他能力。
 
-## 启动与模型配置
+## 启动
 
-先读 [公共准备](../README.md#启动责任与公共准备)。扩展路径必须保留 `extensions/shared/` 相对结构。交互父端或子端均可这样加载：
+先读 [公共准备](../README.md#启动责任与公共准备) 与 [主动通知协议](../../../docs/SESSION-PUSH.md)。
 
 ```bash
 cd "$WORK"
-omp --extension "$REPO/extensions/omp/agent-link.ts" --model "$OMP_MODEL"
-```
-
-`OMP_MODEL` 使用本机 `omp models` 列出的模型标识，认证由 OMP 自行配置。子端额外设置凭据路径（父端服务 ready 后）：
-
-```bash
+export AGENT_LINK_SESSIONS=/absolute/private/session-connections
+# 子端还需父端通信服务已就绪后设置此项；父端不需要子端凭据。
 export AGENT_LINK_CREDENTIALS="$ROOT/child-credentials.json"
 omp --extension "$REPO/extensions/omp/agent-link.ts" --model "$OMP_MODEL"
 ```
 
-父端采用 `parent.framework=omp` 和通信服务 `--framework omp`；子端采用 `child.framework=omp`。取框架实际 session id 填入对应绑定，勿假设 OMP 接受 Pi 的 `--session-id`。已有会话按 `omp --help` 的 `--resume` 方式恢复，并在启动时加载扩展；运行中的进程不承诺支持热挂扩展。需要保持消息接收的子端使用长驻会话，不把执行完即退出的 `-p` 当作常驻服务。
+OMP_MODEL 从本机 omp models 取得，认证由 OMP 配置。保持 extensions/shared 完整。扩展在 session_start 按真实 session id 登记，随后可创建 Binding；不复制 Pi 的 --session-id 参数。父端通信服务 --framework omp，继承相同 AGENT_LINK_SESSIONS。子端应为常驻会话，运行结束即退出的 -p 不提供后续唤醒保证。
 
-## 就绪与功能
+## 就绪、已有会话、清理
 
-父端服务 ready 后，扩展按 registry 匹配真实 session id，或父端显式设置 `AGENT_LINK_BRIDGE_FILE` 和 `AGENT_LINK_BINDING`。注册表可在会话启动后新增绑定，watcher 再发现。子端工具包括 report_parent、ask_parent、check_parent_request、poll_parent_requests、answer_parent。
+检查对应 session descriptor 已登记，宿主服务 ready，再用 report/ask/reply 或 ask-child/answer 闭环。HTTP accepted 仅代表框架注入成功；模型处理需实际答复证明。身份不匹配、会话已退出或接口失败明确报错，不写文件兜底。
 
-父→子事件写 `<root>/inbox/<binding>.jsonl`，子→父事件写 `<root>/omp-bridge/<binding>.jsonl`；当前 watcher 轮询文件。文件落盘只表示传输接受，需 report/ask/reply 或 ask-child/answer 实际闭环判断接入成功。临时 HTTP 推送探针已在真实交互 OMP 18.11.1 中通过 sendUserMessage(aside) 唤醒空闲会话并取得 DeepSeek 答复；探针未整合进正式适配器。会话忙碌、会话切换和重连行为仍为 unknown。
+已有进程须在启动时已加载扩展；恢复使用本机 --resume 参数。session 切换或 shutdown 会关闭旧监听并删除属于自己的记录。结束时先退出专用子会话，再停通信服务，保留用户交互父端。崩溃后先确认旧进程不存在再人工清理残留 descriptor；不覆盖活跃注册。
 
-## 清理
+## 验证
 
-通过运行器停止本次专用 OMP 子进程，再停止通信服务；用户正在使用的交互父端不随子任务取消。没有已实现的 OMP 远程 stop 命令，不套用 Pi RPC stop。保留请求状态供审计，不将 runtime、凭据或真实会话数据入库。
+正式扩展已在交互 OMP 18.11.1 + DeepSeek 下通过空闲通知、工具忙碌时通知、父端 ask/reply 与子端 ask-child/answer。计划模式、用户中断竞争与重连仍为 unknown。工具 report_parent、ask_parent、check_parent_request、poll_parent_requests、answer_parent 保留；主动通知不需要模型反复调用 poll_parent_requests。

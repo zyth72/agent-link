@@ -55,7 +55,7 @@
 
 - `state=starting` 先占位；握手成功并验证 identity 后原子替换为 `ready`。客户端拒绝非 `ready`。
 - token 不打印、不写日志；CLI 输出只给 descriptor 路径与 endpoint。
-- descriptor 只描述控制通道；父→子不通过写文件唤醒（旧 inbox 兼容路径见 §5）。
+- descriptor 只描述控制通道；父→子不通过写文件唤醒（没有 RPC descriptor 时可连接交互 Pi 的 session HTTP 接口）。
 
 ## 3. 控制 HTTP
 
@@ -89,8 +89,8 @@
 
 - `pi` 且 `<root>/pi-rpc/<binding>.json` 存在且可校验（协议、binding/run/child session 身份、`ready`、loopback endpoint）：用共享的 `build_child_prompt` 渲染问题，经 `/v1/prompt`（`streamingBehavior:"steer"`）送入 Pi；不写 inbox；记录 `host_accepted` 后立即进入核心等待状态机等 `answer_parent`。
 - descriptor 存在但不可用（旧协议、身份不匹配、state 非 ready、网络/认证失败）：**明确失败**为 `failed_or_unknown`，不得静默降级到 inbox。
-- descriptor 不存在：保留旧 inbox 兼容（`<root>/inbox/<binding>.jsonl`），detail 明示该路径不会唤醒 Pi RPC 会话；仅当 Pi 侧另有 watcher 时有意义。
-- 其他框架子端仍走 inbox；未实现的子端框架明确报错。
+- descriptor 不存在：改用目标 Pi session 的 HTTP 主动推送接口（见 SESSION-PUSH.md）；接口缺失或失效明确失败，不写 inbox。
+- OMP 子端使用 session HTTP，OpenCode 保持 inbox；未实现的子端框架明确报错。
 
 Codex helper `agent_link.hosts.codex.cli` 在现有 registry/SQLite 归属校验之后提供：
 
@@ -127,6 +127,6 @@ skill wrapper 也支持分发：`link.py --pi-rpc --root ... --binding ... serve
 
 ## 8. 测试与不承诺
 
-- `tests/test_pi_rpc.py`：fake Pi 脚本模拟 RPC（测试注入 argv，不暴露任意 shell）——handshake/身份、并发乱序 id 与异步事件、LF 分帧含 U+2028、`success:false`、超时不重发、子进程退出唤醒、坏帧/过长帧失败、认证与身份校验、重复 serve 不覆盖、只删自己的 descriptor、`ask-child` 直连 RPC 不产生 inbox+answer 反写+幂等、无 descriptor 的 inbox 兼容、其他框架兼容；真实本机 `pi` 的 `get_state`/`stop`（无模型）。
+- `tests/test_pi_rpc.py`：fake Pi 脚本模拟 RPC（测试注入 argv，不暴露任意 shell）——handshake/身份、并发乱序 id 与异步事件、LF 分帧含 U+2028、`success:false`、超时不重发、子进程退出唤醒、坏帧/过长帧失败、认证与身份校验、重复 serve 不覆盖、只删自己的 descriptor、`ask-child` 直连 RPC 不产生 inbox+answer 反写+幂等、无 descriptor 的 session HTTP 接入、其他框架兼容；真实本机 `pi` 的 `get_state`/`stop`（无模型）。
 - `tests/pi/extension_unit.test.mjs`：`answer_parent` 工具注册与 `/v1/answer` 调用。
 - 不承诺 exactly-once、不承诺超时后自动重投、不承诺跨机；模型是否处理仍由父端收到 `answer_parent` 的答复证明。

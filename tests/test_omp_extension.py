@@ -1,13 +1,14 @@
 """OMP extension acceptance: no-model registration, real HTTP loopback closed
-loop, and the parent bridge watcher suite.
+loop, and the session-owned push listener suite.
 
 Child side: loads the real ``extensions/omp/agent-link.ts`` with Bun (its
 native loader) and calls the tools against a real ``agent_link.host`` service
-whose OmpHost driver writes the bridge file; the parent stand-in replies
-through the ordinary Agent Link CLI.  Parent side: drives the same extension's
-bridge watcher with a fake ExtensionAPI over real bridge files (restart resume,
-a failing injection, a second consumer, session switching, file replacement and
-oversized/invalid events).
+whose OmpParentAdapter delivers parent notifications to a mock loopback push
+listener; the parent stand-in replies through the ordinary store API.  Push
+side: drives the same extension's lifecycle with a fake ExtensionAPI over the
+real loopback listener (descriptor discovery, token auth, identity rejection,
+injection semantics, failure recovery, session switching, shutdown and
+duplicate-descriptor refusal).
 
 Never calls a model, never touches a real OMP session.  Skipped when Bun is
 unavailable; the registration test additionally needs the ``omp`` executable.
@@ -28,8 +29,8 @@ import unittest
 from pathlib import Path
 
 from agent_link.errors import AgentLinkError
-from agent_link.registry import entry_from_row, write_entry
 from tests import isolate_registry
+from tests.push_server import MockPushListener, write_descriptor
 from agent_link.storage import Store
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -37,7 +38,7 @@ EXTENSION = REPO_ROOT / "extensions" / "omp" / "agent-link.ts"
 TOOL_LOOP = REPO_ROOT / "tests" / "omp" / "tool_loop.mjs"
 
 NOTIFIER_STUB = '''\
-"""Unused by OmpHost; kept so the binding passes notifier_path validation."""
+"""Unused by the push parent adapter; kept so the binding passes notifier_path validation."""
 def bridge(payload):
     return {"accepted": True}
 '''
@@ -64,19 +65,38 @@ OMP = _find_omp()
 BUN_READY = BUN is not None
 
 
-class OmpChildE2ECase(unittest.TestCase):
-    """Real HTTP loopback: Bun-loaded child tools against a real host service."""
+class SessionsMixin:
+    """Pin AGENT_LINK_SESSIONS to a per-test temp directory."""
+
+    def setUpSessions(self):
+        self.sessions = Path(self.temp.name) / "sessions"
+        previous = os.environ.get("AGENT_LINK_SESSIONS")
+        os.environ["AGENT_LINK_SESSIONS"] = str(self.sessions)
+
+        def restore():
+            os.environ.pop("AGENT_LINK_SESSIONS", None)
+            if previous is not None:
+                os.environ["AGENT_LINK_SESSIONS"] = previous
+
+        self.addCleanup(restore)
+
+
+class OmpChildE2ECase(SessionsMixin, unittest.TestCase):
+    """Real HTTP loopback: Bun-loaded child tools against a real host service
+    whose parent notifications land on a mock push listener."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         isolate_registry(self)
+        self.setUpSessions()
         self.base = Path(self.temp.name)
         self.root = self.base / "state"
         self.stub = self.base / "notifier_stub.py"
         self.stub.write_text(NOTIFIER_STUB, encoding="utf-8")
         self.credentials = self.base / "credentials.json"
         self.binding = "e2e-b"
+        self.parent_session = "e2e-parent"
         store = Store(self.root)
         try:
             store.bind(
@@ -84,14 +104,16 @@ class OmpChildE2ECase(unittest.TestCase):
                     "binding_id": self.binding,
                     "run_id": "e2e-run",
                     "native_task_id": None,
-                    "parent": {"framework": "omp", "session_id": "e2e-parent"},
+                    "parent": {"framework": "omp", "session_id": self.parent_session},
                     "child": {"framework": "omp", "session_id": "e2e-child"},
                     "notifier_path": str(self.stub),
                 }
             )
         finally:
             store.close()
-        self.bridge_file = self.root / "omp-bridge" / f"{self.binding}.jsonl"
+        self.listener = MockPushListener("omp", self.parent_session)
+        self.addCleanup(self.listener.close)
+        write_descriptor(self.sessions, self.listener.descriptor())
         self.hosts: list[subprocess.Popen] = []
         self.addCleanup(self.stop_all_hosts)
 
@@ -104,6 +126,9 @@ class OmpChildE2ECase(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
         self.hosts.clear()
 
     def start_host(self) -> subprocess.Popen:
@@ -240,133 +265,43 @@ class OmpChildE2ECase(unittest.TestCase):
         self.assertEqual(parent_row["status"], "answered")
         self.assertEqual(parent_row["answer"], "child answer")
         self.assertEqual(parent_row["answer_message_id"], ids["parent_answer_message_id"])
-        events = [
-            json.loads(line)
-            for line in self.bridge_file.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        # The host delivered both parent notifications over the push listener.
+        events = self.listener.events
         self.assertEqual(len(events), 2)
-        self.assertEqual([event["kind"] for event in events], ["report", "ask"])
-        self.assertEqual([event["source"] for event in events], ["service", "service"])
+        self.assertEqual([event["role"] for event in events], ["parent", "parent"])
+        self.assertEqual(events[0]["framework"], "omp")
+        self.assertEqual(events[0]["session_id"], self.parent_session)
+        self.assertIn("[agent-link:report]", events[0]["prompt"])
+        self.assertIn("[agent-link:ask]", events[1]["prompt"])
+        self.assertIn("auto-reply", events[1]["prompt"])
+        self.assertFalse((self.root / "omp-bridge").exists(), "no bridge file is written")
 
         self.stop_host(host)
         self.assertFalse(self.credentials.exists(), "graceful shutdown removes its own credentials")
 
 
-class OmpBridgeCase(unittest.TestCase):
-    """Parent-side bridge watcher acceptance, no service and no model."""
-
-    binding = "bridge-b"
+class OmpPushCase(SessionsMixin, unittest.TestCase):
+    """Session-owned push listener acceptance, no service and no model."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         isolate_registry(self)
+        self.setUpSessions()
         self.base = Path(self.temp.name)
-        self.bridge_file = self.base / "omp-bridge" / f"{self.binding}.jsonl"
-        self.inbox_file = self.base / "inbox" / f"{self.binding}.jsonl"
 
-    # -- helpers -------------------------------------------------------
-    def bridge_env(self, extra: dict | None = None) -> dict:
+    def run_push(self, scenario: str, extra_env: dict | None = None, timeout: int = 180) -> dict:
         env = dict(os.environ)
-        env["AGENT_LINK_BRIDGE_FILE"] = str(self.bridge_file)
-        env["AGENT_LINK_BINDING"] = self.binding
         env.pop("AGENT_LINK_CREDENTIALS", None)
-        env.update(extra or {})
-        return env
-
-    def write_events(
-        self,
-        prompts: list[str],
-        binding: str | None = None,
-        thread_id: str = "parent",
-        child_session_id: str = "child",
-        path: Path | None = None,
-    ) -> list[bytes]:
-        target = path or self.bridge_file
-        target.parent.mkdir(parents=True, exist_ok=True)
-        lines = [
-            json.dumps(
-                {
-                    "v": 1,
-                    "ts": "2026-01-01T00:00:00.000Z",
-                    "source": "service",
-                    "binding_id": self.binding if binding is None else binding,
-                    "thread_id": thread_id,
-                    "child_session_id": child_session_id,
-                    "kind": "report",
-                    "message_id": f"m-{index}",
-                    "prompt": prompt,
-                }
-            )
-            + "\n"
-            for index, prompt in enumerate(prompts, start=1)
-        ]
-        with target.open("a", encoding="utf-8") as stream:
-            stream.write("".join(lines))
-        return [line.encode("utf-8") for line in lines]
-
-    def run_bridge(self, scenario: str = "bridge", extra_env: dict | None = None, timeout: int = 180) -> dict:
-        process = subprocess.run(
-            [BUN, str(TOOL_LOOP), scenario],
-            capture_output=True,
-            text=True,
-            cwd=str(REPO_ROOT),
-            env=self.bridge_env(extra_env),
-            timeout=timeout,
-        )
-        self.assertEqual(
-            process.returncode, 0, f"bun {scenario} failed:\n{process.stdout}\n{process.stderr}"
-        )
-        lines = [line for line in process.stdout.splitlines() if line.strip()]
-        self.assertTrue(lines, f"bun {scenario} printed nothing")
-        return json.loads(lines[-1])
-
-    def cursor_offset(self) -> int | None:
-        path = Path(str(self.bridge_file) + ".cursor")
-        if not path.is_file():
-            return None
-        return json.loads(path.read_text(encoding="utf-8"))["offset"]
-
-    # -- auto-claim helpers (session-id discovery) -------------------------
-    def claim_env(
-        self, session_id: str, extra: dict | None = None, bridge_file: Path | None = None
-    ) -> dict:
-        env = dict(os.environ)
         env.pop("AGENT_LINK_BRIDGE_FILE", None)
         env.pop("AGENT_LINK_BINDING", None)
-        env.pop("AGENT_LINK_CREDENTIALS", None)
-        env["AGENT_LINK_TEST_BRIDGE_FILE"] = str(bridge_file or self.bridge_file)
-        env["AGENT_LINK_TEST_SESSION_ID"] = session_id
-        env.update(extra or {})
-        return env
-
-    def write_claim(self, binding: str, parent_session: str, child_session: str = "child") -> None:
-        write_entry(
-            entry_from_row(
-                self.base,
-                {
-                    "binding_id": binding,
-                    "run_id": "r-" + binding,
-                    "native_task_id": None,
-                    "parent_framework": "omp",
-                    "parent_session_id": parent_session,
-                    "child_framework": "omp",
-                    "child_session_id": child_session,
-                    "config_digest": "d" * 64,
-                },
-            )
-        )
-
-    def run_claim(
-        self, scenario: str, session_id: str, timeout: int = 180, bridge_file: Path | None = None
-    ) -> dict:
+        env.update(extra_env or {})
         process = subprocess.run(
             [BUN, str(TOOL_LOOP), scenario],
             capture_output=True,
             text=True,
             cwd=str(REPO_ROOT),
-            env=self.claim_env(session_id, bridge_file=bridge_file),
+            env=env,
             timeout=timeout,
         )
         self.assertEqual(
@@ -376,249 +311,72 @@ class OmpBridgeCase(unittest.TestCase):
         self.assertTrue(lines, f"bun {scenario} printed nothing")
         return json.loads(lines[-1])
 
-    # -- auto-claim tests -------------------------------------------------
     @unittest.skipUnless(BUN_READY, "bun is required")
-    def test_auto_claim_matches_session_id(self):
-        session_id = "parent-auto"
-        self.write_claim("bridge-b", session_id)
-        self.write_events(["auto-1", "auto-2"], thread_id=session_id)
-        out = self.run_claim("bridge-auto-claim", session_id)
-        self.assertEqual([entry["text"] for entry in out["sent"]], ["auto-1", "auto-2"])
-        self.assertTrue(out["lockHeld"])
-        self.assertFalse(out["lockAfterShutdown"], "shutdown must release the lock")
-        self.assertEqual(out["cursor"]["offset"], self.bridge_file.stat().st_size)
-
-    @unittest.skipUnless(BUN_READY, "bun is required")
-    def test_auto_claim_ignores_other_parents_and_foreign_thread(self):
-        session_id = "parent-auto"
-        self.write_claim("other-b", "someone-else")
-        self.write_claim("bridge-b", session_id)
-        self.write_events(["auto-wrong"], thread_id="not-me")
-        self.write_events(["auto-ok"], thread_id=session_id)
-        out = self.run_claim("bridge-auto-claim", session_id)
-        self.assertEqual([entry["text"] for entry in out["sent"]], ["auto-ok"])
-        self.assertTrue(
-            any("skipping invalid event" in line for line in out["logs"]),
-            out["logs"],
-        )
-
-    @unittest.skipUnless(BUN_READY, "bun is required")
-    def test_auto_claim_discovers_late_binding(self):
-        session_id = "parent-auto"
-        process = subprocess.Popen(
-            [BUN, str(TOOL_LOOP), "bridge-auto-claim-late"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=str(REPO_ROOT),
-            env=self.claim_env(session_id),
-        )
-        try:
-            time.sleep(2.5)  # the harness is up while the registry is still empty
-            self.write_claim("bridge-b", session_id)
-            self.write_events(["late-1"], thread_id=session_id)
-            stdout, stderr = process.communicate(timeout=60)
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=10)
-        self.assertEqual(process.returncode, 0, stderr)
-        lines = [line for line in stdout.splitlines() if line.strip()]
-        self.assertTrue(lines)
-        out = json.loads(lines[-1])
-        self.assertEqual([entry["text"] for entry in out["sent"]], ["late-1"])
-        self.assertTrue(out["lockHeld"])
-
-    @unittest.skipUnless(BUN_READY, "bun is required")
-    def test_auto_claim_child_inbox(self):
-        """A child session claims its inbox by child.session_id and gets woken."""
-        session_id = "child-auto"
-        self.write_claim("bridge-b", parent_session="parent-1", child_session=session_id)
-        self.write_events(
-            ["inbox-1", "inbox-2"],
-            thread_id="parent-1",
-            child_session_id=session_id,
-            path=self.inbox_file,
-        )
-        self.write_events(
-            ["inbox-wrong"],
-            thread_id="parent-1",
-            child_session_id="other-child",
-            path=self.inbox_file,
-        )
-        out = self.run_claim("bridge-auto-claim", session_id, bridge_file=self.inbox_file)
-        self.assertEqual([entry["text"] for entry in out["sent"]], ["inbox-1", "inbox-2"])
-        self.assertTrue(
-            any("skipping invalid event" in line for line in out["logs"]),
-            out["logs"],
-        )
-        self.assertTrue(out["lockHeld"])
-        self.assertFalse(out["lockAfterShutdown"])
-
-    @unittest.skipUnless(BUN_READY, "bun is required")
-    def test_failed_injection_retries_in_same_process(self):
-        """Regression: the failed line must be restored byte-exact (with its newline)."""
-        self.write_events(["event-A", "event-B", "event-C"])
-        marker = self.base / "fail.marker"
-        marker.write_text("event-B", encoding="utf-8")
-        out = self.run_bridge(
-            "bridge-fail-retry-same-process", extra_env={"AGENT_LINK_TEST_FAIL_FILE": str(marker)}
-        )
+    def test_push_auth_identity_and_injection(self):
+        out = self.run_push("push-basic")
+        self.assertEqual(out["valid"]["status"], 200)
+        self.assertEqual(out["badToken"]["status"], 403)
+        self.assertEqual(out["noToken"]["status"], 403)
+        self.assertEqual(out["wrongSession"]["status"], 400)
+        self.assertEqual(out["wrongFramework"]["status"], 400)
+        self.assertEqual(out["malformed"]["status"], 400)
+        self.assertEqual(out["oversized"]["status"], 413)
+        self.assertEqual([entry["text"] for entry in out["sent"]], ["push-1"])
         self.assertEqual(
-            [entry["text"] for entry in out["sent"]],
-            ["event-A", "event-B", "event-C"],
-            "a same-process retry must restore the exact line and preserve order",
+            out["sent"][0]["options"],
+            {"deliverAs": "aside", "attribution": "agent"},
+            "an OMP injection is an attributed aside",
         )
-        self.assertEqual(out["cursor"]["offset"], self.bridge_file.stat().st_size)
-
-    # -- tests ---------------------------------------------------------
-    @unittest.skipUnless(BUN_READY, "bun is required")
-    def test_resume_across_restarts(self):
-        self.write_events(["prompt-A", "prompt-B"])
-        size = self.bridge_file.stat().st_size
-        first = self.run_bridge()
-        self.assertEqual([entry["text"] for entry in first["sent"]], ["prompt-A", "prompt-B"])
-        for entry in first["sent"]:
-            self.assertEqual(entry["options"], {"deliverAs": "aside", "attribution": "agent"})
-        self.assertEqual(first["cursor"]["offset"], size)
-        stat = self.bridge_file.stat()
-        self.assertEqual((first["cursor"]["dev"], first["cursor"]["ino"]), (stat.st_dev, stat.st_ino))
-        self.assertTrue(first["notifies"], "each injection is notified")
-        self.assertFalse(first["lockExists"], "shutdown must release the lock")
-        second = self.run_bridge()
-        self.assertEqual(second["sent"], [], "a restart must not replay consumed events")
-        self.assertEqual(second["cursor"]["offset"], size)
+        self.assertEqual(out["descriptor"]["protocol"], "agent-link-push/1")
+        self.assertEqual(out["descriptor"]["framework"], "omp")
+        self.assertFalse(out["descriptorExists"], "shutdown removes the owned descriptor")
 
     @unittest.skipUnless(BUN_READY, "bun is required")
-    def test_failure_blocks_and_preserves_order(self):
-        byte_lines = self.write_events(["event-A", "event-B", "event-C"])
+    def test_push_failure_recovers_and_preserves_order(self):
         marker = self.base / "fail.marker"
-        marker.write_text("event-B", encoding="utf-8")
-        first = self.run_bridge(extra_env={"AGENT_LINK_TEST_FAIL_FILE": str(marker)})
-        self.assertEqual([entry["text"] for entry in first["sent"]], ["event-A"])
-        self.assertIn("injection failed", "\n".join(first["logs"]))
+        out = self.run_push("push-failure", {"AGENT_LINK_TEST_FAIL_FILE": str(marker)})
+        self.assertEqual(out["failure"]["status"], 502)
+        self.assertEqual(out["recovered"]["status"], 200)
+        self.assertEqual([entry["text"] for entry in out["sent"]], ["after-failure"])
         self.assertFalse(marker.exists(), "the failing injection consumes its marker")
-        self.assertEqual(first["cursor"]["offset"], len(byte_lines[0]), "cursor stops before the failure")
-        second = self.run_bridge()
-        self.assertEqual(
-            [entry["text"] for entry in second["sent"]],
-            ["event-B", "event-C"],
-            "the retry resumes at the failed event, not before it",
-        )
-        self.assertEqual(second["cursor"]["offset"], self.bridge_file.stat().st_size)
-        # A UI notify failure must not affect injection or cursor advancement.
-        self.write_events(["event-D"])
-        third = self.run_bridge(extra_env={"AGENT_LINK_TEST_NOTIFY_THROW": "1"})
-        self.assertEqual([entry["text"] for entry in third["sent"]], ["event-D"])
-        self.assertEqual(third["notifies"], [])
-        self.assertEqual(third["cursor"]["offset"], self.bridge_file.stat().st_size)
 
     @unittest.skipUnless(BUN_READY, "bun is required")
-    def test_second_consumer_is_refused_then_reclaimed(self):
-        self.write_events(["event-1"])
-        holder = subprocess.Popen(
-            [BUN, str(TOOL_LOOP), "bridge-hold"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=str(REPO_ROOT),
-            env=self.bridge_env(),
-        )
-        try:
-            holding_line = holder.stdout.readline()
-            self.assertTrue(holding_line, "bridge-hold never reported holding")
-            self.assertTrue(json.loads(holding_line)["holding"])
-            # The holder consumes event-1 on its first tick; wait for its cursor.
-            deadline = time.time() + 15
-            while time.time() < deadline and self.cursor_offset() is None:
-                time.sleep(0.05)
-            taken_offset = self.cursor_offset()
-            self.assertIsNotNone(taken_offset, "the holder never consumed the first event")
-            refused = self.run_bridge()
-            self.assertTrue(refused["refused"], refused)
-            self.assertEqual(refused["sent"], [])
-            self.assertEqual(self.cursor_offset(), taken_offset, "a refused consumer writes no cursor")
-            holder_token = json.loads(holding_line)["lock"]
-            lock_text = Path(str(self.bridge_file) + ".lock").read_text(encoding="utf-8").strip()
-            self.assertEqual(
-                lock_text, holder_token, "a refused consumer leaves the owner's lock alone"
-            )
-        finally:
-            holder.kill()
-            holder.wait(timeout=15)
-            holder.stdout.close()
-            holder.stderr.close()
-        # The stale lock of the dead holder is reclaimed and new events flow.
-        self.write_events(["event-2"])
-        reclaimed = self.run_bridge()
-        self.assertFalse(reclaimed["refused"], reclaimed)
-        self.assertEqual([entry["text"] for entry in reclaimed["sent"]], ["event-2"])
-        self.assertEqual(reclaimed["cursor"]["offset"], self.bridge_file.stat().st_size)
+    def test_push_session_switch_closes_the_old_listener(self):
+        out = self.run_push("push-switch")
+        self.assertEqual(out["firstAccepted"]["status"], 200)
+        self.assertEqual(out["secondAccepted"]["status"], 200)
+        self.assertTrue(out["firstRemoved"], "the previous descriptor is removed on switch")
+        self.assertIsNotNone(out["staleError"], "the old endpoint no longer accepts events")
+        self.assertNotEqual(out["firstEndpoint"], out["secondEndpoint"])
+        self.assertEqual([entry["text"] for entry in out["sent"]], ["first", "second"])
 
     @unittest.skipUnless(BUN_READY, "bun is required")
-    def test_session_switch_reclaims_the_lock_once(self):
-        self.write_events(["switch-event"])
-        out = self.run_bridge(scenario="bridge-switch")
-        self.assertEqual([entry["text"] for entry in out["sent"]], ["switch-event"])
-        self.assertEqual(out["injectedBeforeSwitch"], 1)
-        self.assertGreaterEqual(out["firstCleared"], 1, "the old ctx timer must be cleared")
-        self.assertEqual(out["secondTimers"], 1, "the new session owns exactly one timer")
-        first_token, second_token = out["lockTokens"]
-        self.assertNotEqual(first_token, second_token)
-        self.assertTrue(first_token.split(":")[0].isdigit())
-        self.assertTrue(second_token.split(":")[0].isdigit())
-        self.assertFalse(out["lockExists"], "shutdown releases the lock")
-
-    @unittest.skipUnless(BUN_READY, "bun is required")
-    def test_replace_and_truncate_restart_from_zero(self):
-        self.write_events(["event-A"])
-        first = self.run_bridge()
-        self.assertEqual([entry["text"] for entry in first["sent"]], ["event-A"])
-        # Replacement at the same path (new inode): replay from the beginning.
-        self.bridge_file.unlink()
-        self.write_events(["event-B"])
-        replaced = self.run_bridge()
-        self.assertEqual([entry["text"] for entry in replaced["sent"]], ["event-B"])
-        # Truncation of the same file below the cursor: replay from zero.
-        short = json.dumps(
-            {"v": 1, "binding_id": self.binding, "prompt": "truncated-event", "kind": "report"}
-        ) + "\n"
-        self.assertTrue(len(short.encode("utf-8")) < replaced["cursor"]["offset"])
-        self.bridge_file.write_text(short, encoding="utf-8")
-        truncated = self.run_bridge()
-        self.assertEqual([entry["text"] for entry in truncated["sent"]], ["truncated-event"])
-        self.assertEqual(truncated["cursor"]["offset"], self.bridge_file.stat().st_size)
-
-    @unittest.skipUnless(BUN_READY, "bun is required")
-    def test_oversized_and_invalid_events_are_skipped(self):
-        oversized = json.dumps(
-            {"v": 1, "binding_id": self.binding, "prompt": "x" * (1024 * 1024 + 4096)}
-        )
-        lines = [
-            oversized,
-            json.dumps({"v": 1, "binding_id": self.binding}),  # missing prompt
-            json.dumps({"v": 1, "binding_id": "other-binding", "prompt": "mismatch"}),
-            json.dumps({"v": 1, "binding_id": self.binding, "prompt": "good-event"}),
-        ]
-        self.bridge_file.parent.mkdir(parents=True, exist_ok=True)
-        self.bridge_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        out = self.run_bridge()
-        self.assertEqual([entry["text"] for entry in out["sent"]], ["good-event"])
-        skips = [line for line in out["logs"] if "skip" in line]
-        self.assertEqual(len(skips), 3, out["logs"])
-        self.assertEqual(out["cursor"]["offset"], self.bridge_file.stat().st_size)
-        again = self.run_bridge()
-        self.assertEqual(again["sent"], [], "skipped events must not be retried")
+    def test_duplicate_descriptor_is_refused(self):
+        foreign = {
+            "protocol": "agent-link-push/1",
+            "framework": "omp",
+            "session_id": "omp-dup",
+            "endpoint": "http://127.0.0.1:1",
+            "token": "f" * 64,
+            "pid": 999,
+        }
+        write_descriptor(self.sessions, foreign)
+        out = self.run_push("push-duplicate")
+        self.assertIsNotNone(out["startError"])
+        self.assertRegex(out["startError"], r"EEXIST|exist", out["startError"])
+        self.assertEqual(out["descriptor"], foreign, "a refused listener leaves the foreign descriptor")
 
 
 class OmpRegistrationCase(unittest.TestCase):
-    """The real OMP runtime loads the extension and registers the three tools."""
+    """The real OMP runtime loads the extension and registers the tools."""
 
     @unittest.skipUnless(BUN_READY and OMP, "bun and the omp executable are required")
     def test_real_omp_registers_tools_without_a_model(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
+        sessions = Path(temp.name) / "sessions"
         env = dict(os.environ)
+        env["AGENT_LINK_SESSIONS"] = str(sessions)
         env.pop("AGENT_LINK_CREDENTIALS", None)
         env.pop("AGENT_LINK_BRIDGE_FILE", None)
         env.pop("AGENT_LINK_BINDING", None)
@@ -672,6 +430,9 @@ class OmpRegistrationCase(unittest.TestCase):
                 process.wait()
             process.stdout.close()
             process.stderr.close()
+        # A clean runtime shutdown removes its own session descriptor.
+        leftovers = list(sessions.glob("omp/*.json")) if sessions.exists() else []
+        self.assertEqual(leftovers, [], f"descriptor left behind: {leftovers}")
 
 
 if __name__ == "__main__":

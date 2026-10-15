@@ -660,17 +660,40 @@ class PiRpcCase(unittest.TestCase):
         prompts_after = len([cmd for cmd in self.fake_commands() if cmd.get("type") == "prompt"])
         self.assertEqual(prompts_before, prompts_after, "a replay must not re-prompt Pi")
 
-    def test_ask_child_without_descriptor_keeps_inbox_compatibility(self):
-        asker = self._ask_child("rq-inbox", "pm-inbox", "legacy?")
-        inbox = inbox_path(self.root, self.binding_id)
-        self.wait_for(lambda: inbox.exists(), message="legacy inbox event")
-        event = json.loads(inbox.read_text("utf-8").splitlines()[0])
-        self.assertEqual(event["kind"], "ask_child")
-        self.assertEqual(event["request_id"], "rq-inbox")
+    def test_ask_child_without_rpc_descriptor_uses_session_push(self):
+        # With no pi-rpc controller descriptor the Pi child adapter falls back
+        # to the interactive session's push listener; it never writes an inbox.
+        from tests.push_server import MockPushListener, write_descriptor
+
+        listener = MockPushListener("pi", self.child_session)
+        self.addCleanup(listener.close)
+        sessions = self.base / "sessions"
+        previous = os.environ.get("AGENT_LINK_SESSIONS")
+        os.environ["AGENT_LINK_SESSIONS"] = str(sessions)
+
+        def restore_env():
+            os.environ.pop("AGENT_LINK_SESSIONS", None)
+            if previous is not None:
+                os.environ["AGENT_LINK_SESSIONS"] = previous
+
+        self.addCleanup(restore_env)
+        write_descriptor(sessions, listener.descriptor())
+        asker = self._ask_child("rq-push", "pm-push", "push?")
+        self.wait_for(lambda: len(listener.events) == 1, message="child push event")
+        event = listener.events[0]
+        self.assertEqual(event["binding_id"], self.binding_id)
+        self.assertEqual(event["role"], "child")
+        self.assertEqual(event["framework"], "pi")
+        self.assertEqual(event["session_id"], self.child_session)
         self.assertIn("[agent-link:parent-ask]", event["prompt"])
+        self.assertIn("request_id: rq-push", event["prompt"])
+        self.assertFalse(
+            inbox_path(self.root, self.binding_id).exists(),
+            "the push fallback must not write an inbox file",
+        )
         answered = self.run_core(
-            "answer", "--binding", self.binding_id, "--request-id", "rq-inbox",
-            "--message-id", "am-inbox", "--answer", "legacy answer",
+            "answer", "--binding", self.binding_id, "--request-id", "rq-push",
+            "--message-id", "am-push", "--answer", "push answer",
         )
         self.assertEqual(answered.returncode, 0, answered.stderr)
         out, err = asker.communicate(timeout=30)
@@ -711,17 +734,19 @@ class PiRpcCase(unittest.TestCase):
         self.assertFalse(inbox_path(self.root, self.binding_id).exists())
 
     def test_ask_child_other_framework_still_uses_inbox(self):
+        # OpenCode is the remaining legacy inbox child; OMP now uses the
+        # session-owned push listener instead of an inbox file.
         store = Store(self.root)
         try:
-            self._bind(store, "omp-b", "omp", "omp-child")
+            self._bind(store, "oc-b", "opencode", "oc-child")
         finally:
             store.close()
         asker = subprocess.Popen(
             CORE_CLI
             + [
-                "--root", str(self.root), "ask-child", "--binding", "omp-b",
-                "--request-id", "rq-omp", "--message-id", "pm-omp",
-                "--question", "omp?", "--timeout", "20",
+                "--root", str(self.root), "ask-child", "--binding", "oc-b",
+                "--request-id", "rq-oc", "--message-id", "pm-oc",
+                "--question", "oc?", "--timeout", "20",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -730,13 +755,14 @@ class PiRpcCase(unittest.TestCase):
             env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
         )
         self.processes.append(asker)
-        inbox = inbox_path(self.root, "omp-b")
-        self.wait_for(lambda: inbox.exists(), message="omp inbox event")
+        inbox = inbox_path(self.root, "oc-b")
+        self.wait_for(lambda: inbox.exists(), message="opencode inbox event")
         event = json.loads(inbox.read_text("utf-8").splitlines()[0])
         self.assertEqual(event["kind"], "ask_child")
+        self.assertEqual(event["child_framework"], "opencode")
         answered = self.run_core(
-            "answer", "--binding", "omp-b", "--request-id", "rq-omp",
-            "--message-id", "am-omp", "--answer", "ok",
+            "answer", "--binding", "oc-b", "--request-id", "rq-oc",
+            "--message-id", "am-oc", "--answer", "ok",
         )
         self.assertEqual(answered.returncode, 0, answered.stderr)
         out, err = asker.communicate(timeout=30)
@@ -760,7 +786,8 @@ class PiRpcCase(unittest.TestCase):
         )
         self.services.append(service)
         with mock.patch.dict(
-            os.environ, {"PI_CODING_AGENT_SESSION_DIR": str(session_dir)}, clear=False
+            os.environ, {"PI_CODING_AGENT_SESSION_DIR": str(session_dir),
+                         "AGENT_LINK_SESSIONS": str(self.base / "push-sessions")}, clear=False
         ):
             ready = service.start()
         self.assertEqual(ready["pi_session_id"], self.child_session)

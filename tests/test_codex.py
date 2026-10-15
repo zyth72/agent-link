@@ -493,7 +493,7 @@ class CodexCase(unittest.TestCase):
         self.assertIn("The child process is waiting for a reply.", prompt)
 
     def test_ask_child_closed_loop_with_simulated_child(self):
-        root, _ = self.bind("b-askchild", child_framework="omp", child_session="child-omp")
+        root, _ = self.bind("b-askchild", child_framework="opencode", child_session="child-oc")
         asker = self.popen_codex(
             "--session-id",
             "session-1",

@@ -30,7 +30,7 @@ export function findPiRoot() {
   );
 }
 
-export async function loadExtension() {
+async function jitiLoader() {
   const piRoot = findPiRoot();
   const jitiEntry = path.join(piRoot, "node_modules", "jiti", "lib", "jiti.mjs");
   const codingAgent = path.join(piRoot, "dist", "index.js");
@@ -52,11 +52,22 @@ export async function loadExtension() {
       "@earendil-works/pi-ai": piAi,
     },
   });
+  return { jiti, piRoot };
+}
+
+export async function loadExtension() {
+  const { jiti, piRoot } = await jitiLoader();
   const extension = await jiti.import(EXTENSION_PATH);
   if (typeof extension.default !== "function") {
     throw new Error(`${EXTENSION_PATH} does not export a default extension factory`);
   }
   return { factory: extension.default, piRoot };
+}
+
+/** Load the shared push listener module directly (no extension needed). */
+export async function loadSessionPush() {
+  const { jiti } = await jitiLoader();
+  return jiti.import(path.join(REPO_ROOT, "extensions", "shared", "session-push.ts"));
 }
 
 export function fakePi() {

@@ -2,76 +2,36 @@
  * Driver for tests/test_omp_extension.py.
  *
  * Loads the real OMP extension under Bun (its native loader) with a fake
- * ExtensionAPI and drives either the child tools against a real
- * `python3 -m agent_link.host` service or the parent bridge watcher against a
- * real JSONL bridge file.  Prints one JSON object (last line) with the
- * observed state; `bridge-hold` prints `{"holding":true}` first and then
- * sleeps until it is killed.
+ * ExtensionAPI.  The child scenarios call the tools against a real
+ * `python3 -m agent_link.host` service.  The push scenarios drive the
+ * session-owned authenticated loopback listener: they fire the real
+ * lifecycle, read the descriptor from AGENT_LINK_SESSIONS, send real HTTP
+ * notifications and record what the fake Pi context received.  Prints one JSON
+ * object (last line).
  *
- * Usage: bun tests/omp/tool_loop.mjs child-happy|bridge|bridge-hold|bridge-switch
+ * Usage: bun tests/omp/tool_loop.mjs child-happy|push-basic|push-failure|push-switch|push-duplicate
  * Env:   AGENT_LINK_CREDENTIALS, AGENT_LINK_TEST_IDS (JSON),
- *        AGENT_LINK_BRIDGE_FILE, AGENT_LINK_BINDING,
- *        AGENT_LINK_TEST_FAIL_FILE, AGENT_LINK_TEST_NOTIFY_THROW
+ *        AGENT_LINK_SESSIONS, AGENT_LINK_TEST_SESSION_ID,
+ *        AGENT_LINK_TEST_FAIL_FILE
  */
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { fakeOmp, loadOmpExtension, makeCtx, sleep, waitFor } from "./harness.mjs";
+import { existsSync, writeFileSync } from "node:fs";
+import {
+  descriptorPath,
+  fakeOmp,
+  fireLifecycle,
+  loadOmpExtension,
+  makeCtx,
+  postPush,
+  pushEvent,
+  readDescriptor,
+  sleep,
+} from "./harness.mjs";
 
 const scenario = process.argv[2];
 const ids = JSON.parse(process.env.AGENT_LINK_TEST_IDS ?? "{}");
-const bridgeFile = process.env.AGENT_LINK_BRIDGE_FILE ?? process.env.AGENT_LINK_TEST_BRIDGE_FILE;
 const factory = await loadOmpExtension();
 const { pi, tools, lifecycle, sent, logs } = fakeOmp();
 factory(pi);
-
-function readCursor() {
-  if (!bridgeFile || !existsSync(bridgeFile + ".cursor")) return null;
-  try {
-    return JSON.parse(readFileSync(bridgeFile + ".cursor", "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-function cursorOffset() {
-  const cursor = readCursor();
-  return cursor && Number.isInteger(cursor.offset) ? cursor.offset : null;
-}
-
-function fileSize() {
-  return bridgeFile && existsSync(bridgeFile) ? statSync(bridgeFile).size : null;
-}
-
-function lockToken() {
-  if (!bridgeFile || !existsSync(bridgeFile + ".lock")) return null;
-  return readFileSync(bridgeFile + ".lock", "utf8").trim();
-}
-
-async function fireLifecycle(event, ctx) {
-  for (const handler of lifecycle.get(event) ?? []) {
-    await handler({}, ctx);
-  }
-}
-
-async function driveUntilStable(owner, { timeoutMs = 8000 } = {}) {
-  // Wait until the watcher registered its timer (or logged a refusal) before
-  // judging stability, otherwise an empty timer list looks "stable".
-  await waitFor(() => owner.timers.length > 0 || logs.length > 0, { timeoutMs: 3000 });
-  const deadline = Date.now() + timeoutMs;
-  let previous = "";
-  let stable = 0;
-  while (Date.now() < deadline) {
-    for (const timer of owner.timers) timer.callback();
-    await sleep(50);
-    const signature = JSON.stringify([sent.length, cursorOffset(), logs.length, owner.notifies.length]);
-    if (signature === previous) {
-      stable += 1;
-      if (stable >= 2) break;
-    } else {
-      stable = 0;
-      previous = signature;
-    }
-  }
-}
 
 async function run(label, toolName, params) {
   try {
@@ -80,6 +40,12 @@ async function run(label, toolName, params) {
   } catch (error) {
     return { ok: false, error: String(error?.message ?? error) };
   }
+}
+
+async function startPush(sessionId) {
+  const owner = makeCtx({ sessionId });
+  await fireLifecycle(lifecycle, "session_start", owner.ctx);
+  return { owner, descriptor: readDescriptor("omp", sessionId) };
 }
 
 if (scenario === "child-happy") {
@@ -103,112 +69,111 @@ if (scenario === "child-happy") {
     answer: "child answer",
   });
   console.log(JSON.stringify(out));
-} else if (scenario === "bridge") {
-  const owner = makeCtx();
-  await fireLifecycle("session_start", owner.ctx);
-  const failMarker = process.env.AGENT_LINK_TEST_FAIL_FILE;
-  if (failMarker) {
-    // A failing injection stops the tick; wait for that tick to finish and to
-    // persist the cursor over the events that preceded the failure, then stop
-    // (no further ticks: the retry belongs to the next run).
-    await waitFor(() => !existsSync(failMarker));
-    await waitFor(() => (cursorOffset() ?? 0) > 0);
-  } else {
-    await driveUntilStable(owner);
-  }
-  await fireLifecycle("session_shutdown", owner.ctx);
-  await sleep(150);
-  console.log(
-    JSON.stringify({
-      sent,
-      cursor: readCursor(),
-      size: fileSize(),
-      logs,
-      notifies: owner.notifies,
-      refused: [...logs, ...owner.notifies.map((notify) => notify.message)].some((line) =>
-        line.includes("refused"),
-      ),
-      lockExists: lockToken() !== null,
-    }),
+} else if (scenario === "push-basic") {
+  const sessionId = process.env.AGENT_LINK_TEST_SESSION_ID ?? "omp-push";
+  const { owner, descriptor } = await startPush(sessionId);
+  const valid = await postPush(descriptor, pushEvent(descriptor, { message_id: "m-1", prompt: "push-1" }));
+  const badToken = await postPush(
+    descriptor,
+    pushEvent(descriptor, { message_id: "m-2", prompt: "no" }),
+    { authorization: "wrong" },
   );
-} else if (scenario === "bridge-hold") {
-  const holder = makeCtx();
-  await fireLifecycle("session_start", holder.ctx);
-  await waitFor(() => (lockToken() ?? "") !== "");
-  console.log(JSON.stringify({ holding: true, pid: process.pid, lock: lockToken() }));
-  await sleep(600000);
-} else if (scenario === "bridge-switch") {
-  const first = makeCtx();
-  await fireLifecycle("session_start", first.ctx);
-  await waitFor(() => (lockToken() ?? "") !== "");
-  const firstToken = lockToken();
-  await driveUntilStable(first);
-  const injectedBeforeSwitch = sent.length;
-  const second = makeCtx();
-  await fireLifecycle("session_start", second.ctx);
-  await waitFor(() => {
-    const token = lockToken();
-    return token !== null && token !== "" && token !== firstToken;
+  const noToken = await postPush(
+    descriptor,
+    pushEvent(descriptor, { message_id: "m-3", prompt: "no" }),
+    { authorization: null },
+  );
+  const wrongSession = await postPush(
+    descriptor,
+    pushEvent(descriptor, { session_id: "other", message_id: "m-4", prompt: "no" }),
+  );
+  const wrongFramework = await postPush(
+    descriptor,
+    pushEvent(descriptor, { framework: "pi", message_id: "m-5", prompt: "no" }),
+  );
+  const malformed = await postPush(descriptor, pushEvent(descriptor, {}), { rawBody: "{bad" });
+  const oversized = await postPush(descriptor, pushEvent(descriptor, {}), {
+    rawBody: Buffer.alloc(65537, 97),
   });
-  const secondToken = lockToken();
-  await driveUntilStable(second);
-  await fireLifecycle("session_shutdown", second.ctx);
-  await sleep(150);
+  await fireLifecycle(lifecycle, "session_shutdown", owner.ctx);
+  await sleep(100);
   console.log(
     JSON.stringify({
       sent,
-      injectedBeforeSwitch,
-      firstCleared: first.cleared.length,
-      firstTimers: first.timers.length,
-      secondTimers: second.timers.length,
-      lockTokens: [firstToken, secondToken],
-      lockExists: lockToken() !== null,
-      cursor: readCursor(),
       logs,
+      valid,
+      badToken,
+      noToken,
+      wrongSession,
+      wrongFramework,
+      malformed,
+      oversized,
+      descriptorExists: existsSync(descriptorPath("omp", sessionId)),
+      descriptor,
     }),
   );
-} else if (scenario === "bridge-auto-claim" || scenario === "bridge-auto-claim-late") {
-  // No AGENT_LINK_BRIDGE_FILE/AGENT_LINK_BINDING: the watcher must resolve the
-  // binding itself from the registry by matching this session's id.
-  const owner = makeCtx({ sessionId: process.env.AGENT_LINK_TEST_SESSION_ID });
-  await fireLifecycle("session_start", owner.ctx);
-  if (scenario === "bridge-auto-claim-late") {
-    // The claim appears after session start; keep pumping timers until the
-    // rescan attaches and consumes the events.
-    const deadline = Date.now() + 15000;
-    while (Date.now() < deadline && sent.length === 0) {
-      for (const timer of owner.timers) timer.callback();
-      await sleep(50);
-    }
+} else if (scenario === "push-failure") {
+  const sessionId = "omp-fail";
+  const marker = process.env.AGENT_LINK_TEST_FAIL_FILE;
+  if (marker) writeFileSync(marker, "fail-me", "utf8");
+  const { owner, descriptor } = await startPush(sessionId);
+  const failure = await postPush(
+    descriptor,
+    pushEvent(descriptor, { message_id: "m-f", prompt: "fail-me" }),
+  );
+  const recovered = await postPush(
+    descriptor,
+    pushEvent(descriptor, { message_id: "m-ok", prompt: "after-failure" }),
+  );
+  await fireLifecycle(lifecycle, "session_shutdown", owner.ctx);
+  await sleep(100);
+  console.log(JSON.stringify({ sent, logs, failure, recovered }));
+} else if (scenario === "push-switch") {
+  const first = await startPush("omp-a");
+  const firstAccepted = await postPush(
+    first.descriptor,
+    pushEvent(first.descriptor, { message_id: "m-a", prompt: "first" }),
+  );
+  const second = await startPush("omp-b");
+  const firstRemoved = !existsSync(descriptorPath("omp", "omp-a"));
+  let staleError = null;
+  try {
+    await postPush(first.descriptor, pushEvent(first.descriptor, { message_id: "m-a2", prompt: "stale" }));
+  } catch (error) {
+    staleError = String(error?.code ?? error?.message ?? error);
   }
-  await driveUntilStable(owner);
-  const lockHeld = lockToken() !== null;
-  await fireLifecycle("session_shutdown", owner.ctx);
-  await sleep(150);
+  const secondAccepted = await postPush(
+    second.descriptor,
+    pushEvent(second.descriptor, { message_id: "m-b", prompt: "second" }),
+  );
+  await fireLifecycle(lifecycle, "session_shutdown", second.owner.ctx);
+  await sleep(100);
   console.log(
     JSON.stringify({
       sent,
-      cursor: readCursor(),
       logs,
-      lockHeld,
-      lockAfterShutdown: lockToken() !== null,
+      firstAccepted,
+      secondAccepted,
+      firstRemoved,
+      staleError,
+      firstEndpoint: first.descriptor.endpoint,
+      secondEndpoint: second.descriptor.endpoint,
     }),
   );
-} else if (scenario === "bridge-fail-retry-same-process") {
-  // One-shot injection failure inside one process: the next tick must retry
-  // the exact same bytes (regression: the failed line must be restored with
-  // its newline, otherwise it merges with the next line and both are lost).
-  const owner = makeCtx();
-  await fireLifecycle("session_start", owner.ctx);
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline && sent.length < 3) {
-    for (const timer of owner.timers) timer.callback();
-    await sleep(50);
+} else if (scenario === "push-duplicate") {
+  const sessionId = "omp-dup";
+  let startError = null;
+  try {
+    await startPush(sessionId);
+  } catch (error) {
+    startError = String(error?.message ?? error);
   }
-  await driveUntilStable(owner);
-  await fireLifecycle("session_shutdown", owner.ctx);
-  await sleep(150);
-  console.log(JSON.stringify({ sent, cursor: readCursor(), logs }));
+  console.log(
+    JSON.stringify({
+      startError,
+      descriptor: readDescriptor("omp", sessionId),
+    }),
+  );
 } else {
   throw new Error(`unknown scenario ${scenario}`);
 }

@@ -6,8 +6,8 @@
 
 - Codex 桌面**父端**：主要支持。通知仍经绑定里的 `notifier_path`（本机为 background-tasks 桌面桥）投递；父端用本文件的 helper `python3 -m agent_link.hosts.codex.cli` 发现绑定、查询请求、回复子端。
 - Codex 作为**子端**：尚无适配器，也没有自动 inbox 注入；不要假设 `ask-child` 能唤醒一个 Codex 子会话。
-- Pi 子端：当前只有父端 watcher，没有子端 inbox watcher；`ask-child` 不会自动唤醒 Pi，需要子端进程用 CLI `answer` 答复。
-- OMP / OpenCode 子端：有子端 inbox watcher，`ask-child` 可唤醒（见 HOST-PROTOCOL §6.2、§7）。
+- Pi 子端：专用 RPC 控制器或交互 session HTTP 推送可主动唤醒，使用 answer_parent 或核心 CLI answer 答复。
+- OMP 子端：session HTTP 主动推送；OpenCode 子端：保留 inbox watcher。详见各框架 README。
 
 ## 1. 为什么不能凭消息里的 root 直接 reply
 
@@ -58,7 +58,7 @@ python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BIND
 
 `ask-child` 阻塞到回答或超时。长等待必须放进 background-tasks 的 `run_cli` 后台任务，不要在父轮次里同步等数十分钟。exit 3 表示 `timed_out`；迟到答复仍可用 `get-parent-request` 读到（`late=true`，状态保持 `timed_out`）。
 
-能否用 `ask-child` 唤醒子端取决于**子端适配器**：OMP/OpenCode 有 inbox watcher；Pi 和 Codex 子端目前没有。写入 inbox 成功只代表事件可读（`host_accepted`），不代表子端已处理；是否答复以持久化的 answer 为准。
+能否用 `ask-child` 唤醒子端取决于**子端适配器**：Pi 使用 RPC 或 session HTTP，OMP 使用 session HTTP，OpenCode 保留 inbox watcher，Codex 子端未实现。传输成功只代表接收方接受（`host_accepted`），不代表子端已处理；是否答复以持久化的 answer 为准。
 
 ## 6. 宿主服务 + Pi 子端（Codex 父端推荐流程）
 
@@ -109,9 +109,9 @@ Codex 父端通知 prompt 由 `agent_link/hosts/codex.py` 渲染：
 
 2026-10-16 父端另行真实验收：Pi + DeepSeek 加载原生扩展后，report_parent / ask_parent 经 HTTP 宿主与桌面通知到达当前 Codex；父端使用新 helper 查询并 reply，子模型原样回传新生成的标记。父端再用 helper 后台执行 ask-child，Pi 显式轮询 list-parent-requests、读取问题后执行 answer，父端收到 answered、late=false；子任务正常退出，临时服务已取消。运行标识和原始日志只保存在本机 runtime，不提交。
 
-此证据验证双向请求答复，不是 Pi 子端自动 inbox 注入，也不是 RPC steer。Pi 自身支持 RPC steer / follow_up，但当前运行方式没有接入该控制通道。
+此证据验证双向请求答复，不是 Pi 子端自动 inbox 注入，也不是 RPC steer。该旧测试不覆盖当前已实现的 RPC 控制器；当前控制器见 PI-RPC.md，session HTTP 推送见 SESSION-PUSH.md。
 
-未验证：Codex 作为子端、Pi 子端 inbox 自动唤醒、忙碌期间的自动注入及父轮次结束后的唤醒。
+历史证据的未验证项不代表当前能力，当前范围见各框架 README。Codex 子端仍未实现。
 
 ## Pi RPC 的角色边界
 
