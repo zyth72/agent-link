@@ -113,6 +113,8 @@ python3 -m pip install -e . --no-deps   # 开发模式
 
 ## 文档
 
+- [术语约定](docs/TERMINOLOGY.md)：与 AI 沟通时统一概念和命名；[AGENTS.md](AGENTS.md) 是 AI 项目入口。
+
 - [SPEC.md](SPEC.md)：接口、能力声明、持久化与失败语义。
 - [USAGE.md](USAGE.md)：CLI 用法、状态模型、幂等规则、宿主服务启动与已知限制。
 - [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md)：宿主服务 HTTP 协议、HostDriver 扩展、Pi `--extension` 用法与未验证项。
