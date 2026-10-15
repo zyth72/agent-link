@@ -7,6 +7,7 @@ name = "agent-link"
 dynamic = ["version"]
 description = "Thin cross-framework binding, progress-report and decision-request layer for parent/child agents"
 readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.9"
 keywords = ["agents", "intercom", "task-binding", "orchestration", "cli"]
 classifiers = [
@@ -20,7 +21,7 @@ dependencies = []
 agent-link = "agent_link.cli:main"
 
 [tool.setuptools]
-packages = ["agent_link"]
+packages = ["agent_link", "agent_link.hosts"]
 
 [tool.setuptools.dynamic]
 version = {attr = "agent_link.__version__"}

@@ -42,8 +42,8 @@ CAPABILITIES = {
 }
 
 
-def parse_timeout(value) -> float:
-    return validate_timeout_seconds(value, field="timeout")
+def parse_timeout(value, max_seconds: float | None = None) -> float:
+    return validate_timeout_seconds(value, field="timeout", max_seconds=max_seconds)
 
 
 def _dispatch(store: Store, binding_id: str, message: dict):

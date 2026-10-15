@@ -120,19 +120,40 @@ python3 -m agent_link --root /abs/runtime get-request \
 }
 ```
 
+## 宿主服务与 Pi 子端（可选）
+
+旧 CLI 的父端直接 `reply` 已足够用；当子端是运行中的 Pi 会话、需要原生工具时，父端可在**父端环境**额外启动一个 binding 级 loopback 服务（前置：binding 已由 `bind` 创建）：
+
+```bash
+# 父端（必须）：绑定 127.0.0.1 临时端口，输出 ready JSON 与 0600 凭据文件
+python3 -m agent_link.host --root /abs/runtime --binding live-001 \
+  --credentials /abs/runtime/child-credentials.json
+
+# 子端（Pi）：只需凭据文件，不需要 Codex/background-tasks/桌面依赖
+AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
+  pi -p --no-extensions --extension /abs/repo/extensions/pi/agent-link.ts '<任务>'
+```
+
+- 子端工具：`report_parent`、`ask_parent`、`check_parent_request`；只能访问本 binding 的 `report`/`ask`/`get-request`/`capabilities`，不能 `bind`、`reply`、指定父会话。
+- 父端仍用旧 `reply` CLI 回答同一 SQLite 数据库；`ask` 工具带回真实答复，超时返回 `timed_out` 而不是伪造答案。
+- HTTP 层限制：body 1..65536 字节、读取超时 10s、ask timeout 必须 `0 < t <= 3600`（核心 CLI 不受 3600 限制）。子端断开不会取消等待或删除请求；迟到答复保存为 `late=true`，仍可用 `get-request` 读取。
+- 协议与错误码、HostDriver 扩展方式、`--driver MODULE:OBJECT` 用法见 [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md)。Codex 驱动真实依赖 background-tasks 桌面桥，因此服务只能在父端环境启动；子端不得自行启动服务。
+
 ## 测试
 
 ```bash
 cd /path/to/agent-intercom-workspace
-python3 -m unittest discover -s tests -t . -v
+python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v
 ```
 
-测试使用模拟 notifier（写入临时目录的 stub），不会发送真实桌面消息。覆盖：绑定不可重定向、ID 校验、幂等/冲突、重复回复保护、未知请求、超时与迟到回复、数据库重开恢复、两个独立进程并发冲突、模拟 notifier 失败后不重投；复审补充：慢通知不缩短真实截止时间、跨请求复用回复消息 ID 冲突（含并发）、timeout 变更冲突与非法 timeout 拒绝、deadline 边界（>=）与墙钟回拨下的 `late` 判定。
+测试使用模拟 notifier/driver（不发真实桌面消息）；Pi 扩展测试用 jiti 加载真实扩展、以真实 `agent_link.host` + notifier stub（走旧 CLI reply）做 loopback 闭环，并用 `pi --help` 探针扩展验证 Pi 真实加载（不调用模型）。覆盖：绑定不可重定向、ID 校验、幂等/冲突、重复回复保护、未知请求、超时与迟到回复、数据库重开恢复、两个独立进程并发冲突、模拟 notifier 失败后不重投；复审补充：慢通知不缩短真实截止时间、跨请求复用回复消息 ID 冲突（含并发）、timeout 变更冲突与非法 timeout 拒绝、deadline 边界（>=）与墙钟回拨下的 `late` 判定；宿主服务：认证/统一 JSON 错误/未知字段/方法/路径、body 与 timeout 上限、并发同消息单次投递、驱动失败不重投、跨 binding 隔离、服务重启重放不重投、请求体读超时 408、凭据不覆盖与只删自己的。
 
 ## 已知限制
 
 - 单机、同一 OS 可信用户；不防范恶意同用户进程。
-- 依赖父端桌面消息管道存活；WSL→Windows 通知需要 `CODEX_APP_TOOLS_PIPE_PATH` 等环境变量（由 Codex 桌面会话注入）。
+- 依赖父端桌面消息管道存活；WSL→Windows 通知需要 `CODEX_APP_TOOLS_PIPE_PATH` 等环境变量（由 Codex 桌面会话注入）。宿主服务也会加载同一 binding 的 notifier，因此必须由父端环境启动。
+- loopback 宿主服务只承诺同机、单 binding/单 token、子端不能 bind/reply；不承诺跨机器、MCP、Intercom 兼容或恶意同用户隔离。
 - 文件/数据库轮询有延迟（默认 0.1s），不承诺应用重启后通知可用，不实现 exactly-once 外部投递。
 - 墙钟回拨可能影响迟到判定；已记录 `wall_clock_jump_observed` 审计事件，但无法消除该限制。
 - 不实现 spawn/cancel；不绑定未启动的任务；不实现自动清理。
+- 本轮未用新宿主服务发送真实桌面通知，也未做 LLM 端到端工具调用（只验证扩展真实加载与工具执行）。

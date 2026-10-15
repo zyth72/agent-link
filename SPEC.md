@@ -12,6 +12,7 @@
 
 - 核心：绑定、消息/请求标识、幂等与冲突检查、持久化、状态转换。
 - 适配器：父端通知、子端等待答复；框架 ID 与原生会话/任务 ID 保持独立。
+- 可选宿主服务（附加实现，不改本节语义）：父端可在本机启动 binding 级 loopback HTTP 服务，子端只持 endpoint/token 访问 report/ask/get-request；宿主驱动以 `HostDriver` 协议替换。协议、错误、资源上限与生命周期见 `docs/HOST-PROTOCOL.md`。
 - CLI：为 shell agent 提供通用入口。Python 标准库实现，无第三方运行依赖。
 - 可选生命周期接口：spawn/cancel，v0.1 声明不支持；可以绑定已经启动的任务。
 

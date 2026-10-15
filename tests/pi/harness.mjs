@@ -1,0 +1,74 @@
+/**
+ * Shared helpers for the Pi Agent Link extension tests.
+ *
+ * Loads the real TypeScript extension through the same jiti aliases the Pi
+ * runtime uses and returns a fake ExtensionAPI that records registered tools.
+ * The extension's imports are aliased to the locally installed Pi packages, so
+ * no dependency installation and no model call is needed.
+ */
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+export const EXTENSION_PATH =
+  process.env.AGENT_LINK_EXTENSION ?? path.join(REPO_ROOT, "extensions", "pi", "agent-link.ts");
+
+export function findPiRoot() {
+  const candidates = [];
+  if (process.env.PI_CODING_AGENT_ROOT) candidates.push(process.env.PI_CODING_AGENT_ROOT);
+  if (process.env.HOME) {
+    candidates.push(
+      path.join(process.env.HOME, ".npm-global", "lib", "node_modules", "@earendil-works", "pi-coding-agent"),
+    );
+  }
+  for (const candidate of candidates) {
+    if (candidate && existsSync(path.join(candidate, "dist", "index.js"))) return candidate;
+  }
+  throw new Error(
+    "Cannot locate @earendil-works/pi-coding-agent; set PI_CODING_AGENT_ROOT to its package root",
+  );
+}
+
+export async function loadExtension() {
+  const piRoot = findPiRoot();
+  const jitiEntry = path.join(piRoot, "node_modules", "jiti", "lib", "jiti.mjs");
+  const codingAgent = path.join(piRoot, "dist", "index.js");
+  const piAi = path.join(
+    piRoot,
+    "node_modules",
+    "@earendil-works",
+    "pi-ai",
+    "dist",
+    "compat.js",
+  );
+  for (const required of [jitiEntry, codingAgent, piAi]) {
+    if (!existsSync(required)) throw new Error(`Missing test dependency: ${required}`);
+  }
+  const { createJiti } = await import(pathToFileURL(jitiEntry).href);
+  const jiti = createJiti(import.meta.url, {
+    alias: {
+      "@earendil-works/pi-coding-agent": codingAgent,
+      "@earendil-works/pi-ai": piAi,
+    },
+  });
+  const extension = await jiti.import(EXTENSION_PATH);
+  if (typeof extension.default !== "function") {
+    throw new Error(`${EXTENSION_PATH} does not export a default extension factory`);
+  }
+  return { factory: extension.default, piRoot };
+}
+
+export function fakePi() {
+  const tools = new Map();
+  const pi = {
+    registerTool(tool) {
+      if (!tool || typeof tool.name !== "string" || typeof tool.execute !== "function") {
+        throw new Error("registerTool received an invalid tool definition");
+      }
+      tools.set(tool.name, tool);
+      return tool;
+    },
+  };
+  return { pi, tools };
+}

@@ -122,11 +122,15 @@ def require_text(value, field: str) -> str:
     return value
 
 
-def validate_timeout_seconds(value, field: str = "timeout_seconds") -> float:
+def validate_timeout_seconds(
+    value, field: str = "timeout_seconds", max_seconds: float | None = None
+) -> float:
     """Validate a request timeout in the core API (not only in the CLI).
 
     A timeout is part of request semantics, so it must be a positive finite
-    number; replaying an ask with a different timeout is a conflict.
+    number; replaying an ask with a different timeout is a conflict.  Callers
+    that hold a thread while waiting (the loopback host service) additionally
+    pass ``max_seconds`` so an unbounded wait cannot pin a server thread.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise ValidationError(f"{field} must be a positive finite number of seconds, got {value!r}")
@@ -136,6 +140,8 @@ def validate_timeout_seconds(value, field: str = "timeout_seconds") -> float:
         raise ValidationError(f"{field} must be a positive finite number of seconds, got {value!r}")
     if not math.isfinite(seconds) or seconds <= 0:
         raise ValidationError(f"{field} must be a positive finite number of seconds, got {value!r}")
+    if max_seconds is not None and seconds > max_seconds:
+        raise ValidationError(f"{field} must be <= {max_seconds:g} seconds, got {value!r}")
     return seconds
 
 
@@ -550,6 +556,28 @@ class Store:
         row = self._request_row(binding_id, request_id)
         if row is None:
             raise NotFoundError(f"unknown request_id {request_id!r} for binding {binding_id!r}")
+        # Reading an expired request applies the same deadline rule as waiting:
+        # once the persisted wall-clock deadline has passed it is timed_out,
+        # even if no waiter ever updated the row (for example after the child
+        # disconnected or the host service restarted).  The common case stays
+        # read-only; the write transaction only runs when the deadline passed.
+        if row["status"] == "pending" and time.time() >= row["deadline_epoch"]:
+            with self._write():
+                current = self._request_row(binding_id, request_id)
+                if (
+                    current is not None
+                    and current["status"] == "pending"
+                    and time.time() >= current["deadline_epoch"]
+                ):
+                    self.conn.execute(
+                        "UPDATE requests SET status = 'timed_out', updated_at = ?"
+                        " WHERE binding_id = ? AND request_id = ? AND status = 'pending'",
+                        (utc_now_iso(), binding_id, request_id),
+                    )
+                    self._event(
+                        "request_timed_out", binding_id=binding_id, request_id=request_id
+                    )
+                row = self._request_row(binding_id, request_id)
         result = dict(row)
         result["late"] = bool(row["late"])
         message = self._message_row(binding_id, row["message_id"])

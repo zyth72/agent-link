@@ -648,6 +648,21 @@ class StoreUnitCase(unittest.TestCase):
         self.assertFalse(replay["new"])
         self.assertEqual(replay["request"]["timeout_seconds"], 60.0)
 
+    def test_core_get_request_applies_passed_deadline(self):
+        """Reading an expired pending request (for example after the child
+        disconnected and no waiter updated it) must report timed_out."""
+        with mock.patch("agent_link.storage.time.time", return_value=2000.0):
+            self.store.prepare_ask("bind-u", "req-exp", "q-exp", "q", 10.0)
+            pending = self.store.get_request("bind-u", "req-exp")
+        self.assertEqual(pending["status"], "pending")
+        with mock.patch("agent_link.storage.time.time", return_value=2010.0):
+            expired = self.store.get_request("bind-u", "req-exp")
+        self.assertEqual(expired["status"], "timed_out")
+        # The first late reply is still stored once, with late=true.
+        stored = self.store.reply("bind-u", "req-exp", "r-exp", "late answer")
+        self.assertEqual(stored["status"], "timed_out")
+        self.assertTrue(stored["late"])
+
     def test_core_deadline_boundary_is_timed_out(self):
         with mock.patch("agent_link.storage.time.time", return_value=1000.0):
             self.store.prepare_ask("bind-u", "req-at", "q-at", "q", 10.0)
