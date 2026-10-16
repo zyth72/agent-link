@@ -7,7 +7,7 @@
 - Codex 桌面**父端**：主要支持。通知仍经绑定里的 `notifier_path`（本机为 background-tasks 桌面桥）投递；父端用本文件的 helper `python3 -m agent_link.hosts.codex.cli` 发现绑定、查询请求、回复子端。
 - Codex 作为**子端**：尚无适配器，也没有自动 inbox 注入；不要假设 `ask-child` 能唤醒一个 Codex 子会话。
 - Pi 子端：专用 RPC 控制器或交互 session HTTP 推送可主动唤醒，使用 answer_parent 或核心 CLI answer 答复。
-- OMP 子端：session HTTP 主动推送；OpenCode 子端：保留 inbox watcher。详见各框架 README。
+- OMP 子端：session HTTP 主动推送；OpenCode 子端：原生 prompt HTTP 推送（描述符契约）。详见各框架 README。
 
 ## 1. 为什么不能凭消息里的 root 直接 reply
 
@@ -48,17 +48,20 @@ python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BIND
 | --- | --- |
 | `reply --request-id R --message-id M --answer A` | 回复子端 `ask`；状态 `replied` |
 | `ask-child --request-id R --message-id M --question Q --timeout T` | 父端向子端提问并阻塞等待；状态 `answered` |
+| `send-child --request-id R --message-id M --question Q --timeout T` | 非阻塞下发请求：持久化+投递后立即返回（0 host_accepted / 7 失败或未确定），复用核心 `cmd_send_child` |
 | `get-request --request-id R` | 查询子端请求与迟到答复 |
 | `get-parent-request --request-id R` | 查询父端请求状态 |
 | `list-parent-requests [--pending]` | 列出父端请求 |
 
 `reply` 与 `answer` 不能混用：`reply` 答复子端发起的 `ask`（`pending -> replied | timed_out`）；`answer`（或宿主 `/v1/answer`）答复父端发起的 `ask-child`（`pending -> answered | timed_out`）。同 ID 重放幂等，答复不可覆盖。
 
-## 5. ask-child 会阻塞
+## 5. ask-child 会阻塞；send-child 不会
 
 `ask-child` 阻塞到回答或超时。长等待必须放进 background-tasks 的 `run_cli` 后台任务，不要在父轮次里同步等数十分钟。exit 3 表示 `timed_out`；迟到答复仍可用 `get-parent-request` 读到（`late=true`，状态保持 `timed_out`）。
 
-能否用 `ask-child` 唤醒子端取决于**子端适配器**：Pi 使用 RPC 或 session HTTP，OMP 使用 session HTTP，OpenCode 保留 inbox watcher，Codex 子端未实现。传输成功只代表接收方接受（`host_accepted`），不代表子端已处理；是否答复以持久化的 answer 为准。
+要随时向子端下发消息而不等答复，用 `send-child`（核心 CLI 与 helper 同名同参数）：投递返回后立即结束，`host_accepted` 为 0，`failed_or_unknown` 为 7；同 `request_id`/`message_id` 重放不二次投递，之后可用 `get-parent-request` 或 `list-parent-requests` 查询状态。收到问题与否仍取决于子端适配器与模型调度（busy/空闲行为未验收时保持 unknown）。
+
+能否用 `ask-child` 唤醒子端取决于**子端适配器**：Pi 使用 RPC 或 session HTTP，OMP 使用 session HTTP，OpenCode 使用原生 prompt HTTP 推送（描述符契约），Codex 子端未实现。传输成功（接受或 2xx）只代表接收方接受，不代表子端已处理；是否答复以持久化的 answer 为准。
 
 ## 6. 宿主服务 + Pi 子端（Codex 父端推荐流程）
 

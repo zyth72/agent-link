@@ -10,7 +10,7 @@
 
 ## 状态
 
-Pi/OMP 的正式扩展使用会话 HTTP 主动推送，无文件轮询；OpenCode 保留文件 watcher。Pi 专用子端还可使用 RPC。框架能力、启动、关联管理与清理见 [接入指南](agent_link/hosts/README.md) 和 [主动通知协议](docs/SESSION-PUSH.md)。
+Pi/OMP 的正式扩展使用会话 HTTP 主动推送，无文件轮询；OpenCode 使用框架原生 prompt HTTP 推送（描述符契约，见 [HOST-PROTOCOL §6.3](docs/HOST-PROTOCOL.md)）。Pi 专用子端还可使用 RPC。框架能力、启动、关联管理与清理见 [接入指南](agent_link/hosts/README.md) 和 [主动通知协议](docs/SESSION-PUSH.md)。
 
 模型端到端：真实 DeepSeek 已验证 Pi/OMP 交互父端的空闲通知与 ask/reply，以及 OMP 子端的 ask-child/answer。模拟测试、真实接口和模型验收分别记录，忙碌/中断/重连行为未验证时保持 unknown，不承诺 exactly-once。
 
@@ -24,7 +24,7 @@ Pi/OMP 的正式扩展使用会话 HTTP 主动推送，无文件轮询；OpenCod
 | Codex 桌面父端（推荐配套） | [codex-background-tasks](https://github.com/zyth72/codex-background-tasks) 插件（提供 `run_cli` 与 `notifier.py` 桌面桥），桌面应用存活 | 绑定的 `notifier_path` 指向该插件的 `notifier.py`；由 `run_cli` 启动宿主服务与子任务 |
 | Pi 父端 / 子端 | Pi（本机验证 1.2.0） | 用户级安装一次（见下），或临时 `pi -p --no-extensions --extension <repo>/extensions/pi/agent-link.ts`；子端另需 `AGENT_LINK_CREDENTIALS=<凭据文件>`；父端：同一扩展按 session 注册本地 HTTP 接口，主动推送，无需轮询 |
 | OMP 父端 / 子端 | OMP（本机验证 18.11.1，Bun 运行时；更旧版本未验证） | 会话启动时加载 `extensions/omp/agent-link.ts`（见下）；父端与子端按实际 session 登记 HTTP 接口，子端另需 `AGENT_LINK_CREDENTIALS` |
-| OpenCode 父端 / 子端 | OpenCode（本机验证 2.0.29；只接受 v2 插件形态，v1 会被拒绝） | 插件 `extensions/opencode/agent-link.ts` 放入 `~/.config/opencode/plugin/` 自动发现；子端另需 `AGENT_LINK_CREDENTIALS` |
+| OpenCode 父端 / 子端 | OpenCode（本机验证 2.0.29；只接受 v2 插件形态，v1 会被拒绝） | 插件 `extensions/opencode/agent-link.ts` 放入 `~/.config/opencode/plugin/` 自动发现；子端另需 `AGENT_LINK_CREDENTIALS`；父/子推送另需集成自管 serve 及其会话/serve 描述符（`AGENT_LINK_SESSIONS`，切片 3 提供启动编排） |
 
 ### OMP 扩展安装
 
@@ -67,15 +67,14 @@ agent_link/          # Python 包：CLI、SQLite 状态机、通知适配器、�
   hosts/codex/      # Codex 父端适配与 cli.py
   hosts/pi/         # Pi 父子适配与 RPC 控制器
   hosts/omp/        # OMP 父子适配
-  hosts/opencode/   # OpenCode 父子适配
-  shared.py         # 公共消息渲染与文件桥工具
+  hosts/opencode/   # OpenCode 父子适配（原生 prompt HTTP 推送；描述符契约）
+  shared.py         # 公共消息渲染与文件桥工具（OpenCode Python 适配已不引用）
 extensions/
   shared/agent-link-client.ts            # Pi/OMP/OpenCode 共用的子端 HTTP 客户端
-  shared/bridge-watcher.ts               # OpenCode 文件桥 watcher 实现（锁/cursor/自动认领/保序重试）
   shared/session-push.ts                 # Pi/OMP 会话 HTTP 接收接口
   pi/agent-link.ts                       # Pi 子端四工具 + 会话推送
   omp/agent-link.ts                      # OMP 五个工具 + 会话推送
-  opencode/agent-link.ts                 # OpenCode v2 插件：五个工具 + 父子 watcher（共享模块薄适配）
+  opencode/agent-link.ts                 # OpenCode v2 插件：五个子端工具（消息投递由 Python 适配器原生 prompt 推送）
 tests/               # unittest 测试（模拟 notifier/driver，不发真实桌面消息）
   pi/                # Node/jiti 扩展测试与真实 HTTP 闭环驱动脚本
   omp/               # Bun 扩展测试 harness 与桥验收驱动脚本

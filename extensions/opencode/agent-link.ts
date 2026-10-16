@@ -9,46 +9,18 @@
  * 2.0.x ("Plugin must export a default definition with an id and an effect or
  * setup function"), so no v1 fallback is provided.
  *
- * Two roles share this one plugin:
+ * This plugin registers the five child tools.  With an AGENT_LINK_CREDENTIALS
+ * file from the parent host service, report_parent / ask_parent /
+ * check_parent_request behave exactly like the OMP/Pi extensions' tools (same
+ * names, texts and semantics); answer_parent / poll_parent_requests serve
+ * parent-initiated requests (ask_child).  They cannot choose a parent session,
+ * create bindings or reply to their own requests.
  *
- * Child tools -- with an AGENT_LINK_CREDENTIALS file from the parent host
- * service, report_parent / ask_parent / check_parent_request behave exactly
- * like the OMP/Pi extensions' tools (same names, texts and semantics);
- * answer_parent / poll_parent_requests serve parent-initiated requests
- * (ask_child).  They cannot choose a parent session, create bindings or reply
- * to their own requests.
- *
- * Bridge watchers -- with AGENT_LINK_BRIDGE_FILE + AGENT_LINK_BINDING set, the
- * plugin consumes that parent bridge file explicitly.  Without them, the
- * plugin auto-claims from the user-level registry (~/.agent-link/registry/,
- * override AGENT_LINK_REGISTRY): a binding whose parent.session_id matches the
- * tracked session makes it watch <root>/omp-bridge/<binding>.jsonl
- * (child->parent), and a binding whose child.session_id matches makes it watch
- * <root>/inbox/<binding>.jsonl (parent->child); both may be held at once.
- * Validated events are injected with ctx.session.prompt (delivery "queue").
- * Per-file single-consumer lock (<file>.lock) and persisted cursor
- * (<file>.cursor, with file identity) apply to each watched file; the watcher
- * itself is shared with the OMP/Pi adapters in extensions/shared/bridge-watcher.ts.
- *
- * Session identity: the plugin runs server-level per location and is not told
- * a session id at setup.  It tracks the most recently active session (the
- * session.prompt hook and session.created events for top-level sessions) and
- * the watchers follow that session: they start when the first session is
- * observed (env mode and auto-claim alike), and when activity moves to
- * another session the watchers are stopped and re-claimed for the new
- * session.  Injections always target the currently tracked session; with none
- * observed yet an injection fails and is retried (order is preserved by the
- * shared watcher).
- * Known limitations: several sessions of one location share this tracking
- * (last active wins), subagent sessions (session.created with parentID) never
- * become the tracked session, and one server process serving several
- * locations would share the module-level watcher state -- run one location
- * per server.
- *
- * Delivery is at-least-once: an event is replayed if the process dies after
- * injection but before the cursor is persisted, and a wholesale replacement of
- * the bridge file replays it from the start.  An event whose injection keeps
- * failing blocks later events until it succeeds so the order is preserved.
+ * Message transport is owned by the host side: the Python adapters push
+ * through the native prompt HTTP endpoint (HTTP Basic plus the frozen
+ * session/serve descriptor contract, docs/HOST-PROTOCOL.md section 6.3).
+ * This plugin does not watch bridge files, hold locks/cursors or inject with
+ * ctx.session.prompt.
  */
 import {
   ASK_RESPONSE_GRACE_MS,
@@ -56,11 +28,6 @@ import {
   asText,
   callHost,
 } from "../shared/agent-link-client.ts";
-import {
-  startBridgeWatchers,
-  stopBridgeWatchers,
-  type BridgeHost,
-} from "../shared/bridge-watcher.ts";
 
 /** Structural subset of the OpenCode v2 plugin context this adapter uses. */
 type JsonSchema = Record<string, unknown>;
@@ -76,34 +43,10 @@ type ToolDefinition = {
   execute(input: Record<string, unknown>, context: ToolExecuteContext): Promise<ToolResult>;
 };
 
-type Registration = { dispose(): Promise<void> | void };
-
-type PromptHookInput = { sessionID?: string };
-
-type OpenCodeEvent = { type?: string; data?: Record<string, unknown> };
-
 type OpenCodePluginContext = {
   tool: {
     transform(callback: (editor: { add(tool: ToolDefinition): void }) => void): Promise<unknown>;
   };
-  session: {
-    prompt(input: {
-      sessionID: string;
-      text: string;
-      delivery?: "steer" | "queue";
-    }): Promise<unknown>;
-    hook(
-      name: "prompt",
-      callback: (input: PromptHookInput) => void | Promise<void>,
-    ): Promise<Registration>;
-  };
-  event: { subscribe(): AsyncIterable<OpenCodeEvent> };
-};
-
-/** Mutable session tracking shared by the host callbacks. */
-type BridgeContext = {
-  oc: OpenCodePluginContext;
-  tracked: { sessionId: string | undefined };
 };
 
 function logError(message: string): void {
@@ -310,30 +253,6 @@ function toolDefinitions(): ToolDefinition[] {
   ];
 }
 
-/** Host-specific behavior for the shared bridge watcher (shared/bridge-watcher.ts). */
-function bridgeHost(): BridgeHost<BridgeContext> {
-  return {
-    framework: "opencode",
-    roles: ["parent", "child"],
-    // The plugin runs once per location at server level; there is no sub
-    // session sharing this module state, so every setup is "main".
-    isMain: () => true,
-    sessionId: (ctx) => ctx.tracked.sessionId,
-    setTimer: (_ctx, callback, ms) => setInterval(callback, ms),
-    clearTimer: (_ctx, handle) => clearInterval(handle as NodeJS.Timeout),
-    inject: async (ctx, prompt) => {
-      const sessionId = ctx.tracked.sessionId;
-      if (!sessionId) {
-        throw new Error("no OpenCode session observed yet; cannot inject");
-      }
-      await ctx.oc.session.prompt({ sessionID: sessionId, text: prompt, delivery: "queue" });
-    },
-    // Server-level plugins have no UI surface; watcher activity is logged.
-    notify: () => {},
-    logError: (message) => logError(message),
-  };
-}
-
 const plugin = {
   id: "agent-link",
   async setup(oc: OpenCodePluginContext) {
@@ -345,67 +264,10 @@ const plugin = {
       logError(`tool registration failed: ${(error as Error).message}`);
     }
 
-    const ctx: BridgeContext = { oc, tracked: { sessionId: undefined } };
-    const host = bridgeHost();
-    // Serialize watcher restarts so rapid session switches cannot interleave
-    // stop/claim cycles.
-    let refreshChain: Promise<void> = Promise.resolve();
-    const refreshWatchers = (): void => {
-      refreshChain = refreshChain
-        .then(() => startBridgeWatchers(host, ctx))
-        .catch((error: unknown) => {
-          logError(`bridge watcher restart failed: ${(error as Error).message}`);
-        });
-    };
-    const noteSession = (sessionId: string | undefined): void => {
-      if (!sessionId || sessionId === ctx.tracked.sessionId) return;
-      ctx.tracked.sessionId = sessionId;
-      refreshWatchers();
-    };
-
-    let promptRegistration: Registration | undefined;
-    try {
-      promptRegistration = await oc.session.hook("prompt", (input) => {
-        noteSession(typeof input.sessionID === "string" ? input.sessionID : undefined);
-      });
-    } catch (error) {
-      logError(`session prompt hook failed: ${(error as Error).message}`);
-    }
-
-    let disposed = false;
-    void (async () => {
-      try {
-        for await (const event of oc.event.subscribe()) {
-          if (disposed) return;
-          // Only top-level sessions retarget the watchers; subagent sessions
-          // (session.created with parentID) share their parent's binding.
-          if (event?.type === "session.created") {
-            const data = asRecord(event.data);
-            if (data && (data.parentID === undefined || data.parentID === null)) {
-              noteSession(typeof data.sessionID === "string" ? data.sessionID : undefined);
-            }
-          }
-        }
-      } catch (error) {
-        if (!disposed) logError(`event subscription failed: ${(error as Error).message}`);
-      }
-    })();
-
-    // Watchers (env mode and auto-claim alike) start when the first session
-    // is observed: injections need a session to target, and claiming without
-    // one is impossible.  Restarting later follows the active session.
-    return async () => {
-      disposed = true;
-      try {
-        await promptRegistration?.dispose();
-      } catch {
-        // Disposing a hook on a gone location is harmless.
-      }
-      await stopBridgeWatchers();
-      // The event loop ends when the host closes the subscription (the real
-      // adapter closes it on plugin unload); do not await it here: a pending
-      // iterator would block cleanup forever.
-    };
+    // No watchers or session tracking: message transport belongs to the host
+    // side (Python native prompt push).  Cleanup is a no-op for symmetry with
+    // the plugin API.
+    return async () => {};
   },
 };
 

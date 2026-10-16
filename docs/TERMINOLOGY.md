@@ -23,12 +23,12 @@
 | 跨框架协作层 | Cross-framework Collaboration Layer | Agent Link 项目的定位：统一绑定、汇报、决策请求与答复，不接管所有框架的生命周期。 |
 | 后台运行器 | Task Runner | 启动、查询、取消后台执行，管理执行超时与退出；Codex 当前使用 background-tasks，其他框架可用原生机制。TaskRunner 是架构角色，当前 Agent Link 没有同名通用接口。 |
 | 父端宿主适配器 | Host Adapter | 将通知投递到父会话并声明宿主能力；代码接口 ParentAdapter，Codex 实现 CodexParentAdapter。不把整个框架称为适配器。 |
-| 子端适配器 | Child Adapter | 把通信操作暴露为子 agent 可调用的工具；当前为 Pi 扩展 extensions/pi/agent-link.ts 与 OMP 扩展 extensions/omp/agent-link.ts（两侧在 session_start 注册 HTTP 接收接口；OMP 父→子也使用主动推送；共享实现 extensions/shared/session-push.ts）。 |
+| 子端适配器 | Child Adapter | 把通信操作暴露为子 agent 可调用的工具；当前为 Pi 扩展 extensions/pi/agent-link.ts、OMP 扩展 extensions/omp/agent-link.ts 与 OpenCode 插件 extensions/opencode/agent-link.ts（Pi/OMP 在 session_start 注册 HTTP 接收接口；OMP 父→子也使用主动推送；共享实现 extensions/shared/session-push.ts）。 |
 | 通信服务 | Link Service | 为子端提供认证、绑定范围内的通信入口及请求状态；当前入口 python3 -m agent_link.host，类 HostService。 |
-| 通知桥 | Notification Bridge | 连接具体宿主接口的投递实现；Codex 当前使用 background-tasks 中的 notifier.py / app_bridge.mjs；Pi/OMP 使用 session HTTP 主动推送；OpenCode 仍使用文件桥。 |
-| 桥接文件 | Bridge File | OpenCode 当前仍使用的父端通知 JSONL 文件（`<root>/omp-bridge/<binding_id>.jsonl`）；由适配器 watcher 以单消费者锁轮询并注入，不是消息队列，不承诺 exactly-once（at-least-once）。 |
+| 通知桥 | Notification Bridge | 连接具体宿主接口的投递实现；Codex 当前使用 background-tasks 中的 notifier.py / app_bridge.mjs；Pi/OMP 使用 session HTTP 主动推送；OpenCode 使用框架原生 prompt HTTP 推送（描述符契约，见 HOST-PROTOCOL §6.3）。 |
+| 桥接文件 | Bridge File | 已废弃术语：OpenCode 迁移前的父端通知 JSONL 文件（`<root>/omp-bridge/<binding_id>.jsonl`）。去轮询切片 2 已删除插件 watcher 与该文件，仓库不再有实现；历史文档出现此词仅指旧实现。 |
 | 绑定索引 / 注册表 | Binding Registry | 用户级发现索引（`~/.agent-link/registry/`，`AGENT_LINK_REGISTRY` 可覆盖）：bind 与宿主服务写入绑定条目，父/子端适配器按本会话 id 自动认领绑定；只是发现指针，权威记录仍是各 runtime root 的 SQLite。 |
-| 收件箱文件 | Inbox File | 父→子通道事件落盘的 JSONL（`<root>/inbox/<binding_id>.jsonl`）；OpenCode 子端 watcher 注入子会话；Pi RPC、OMP 推送不依赖此文件。 |
+| 收件箱文件 | Inbox File | 已废弃术语：OpenCode 迁移前的父→子事件 JSONL（`<root>/inbox/<binding_id>.jsonl`）。去轮询切片 2 已删除；Pi RPC、Pi/OMP session push 与 OpenCode 原生 prompt 推送均不使用。 |
 | 会话注入 | Session Injection | receive_mode 的一种：把通过校验的桥事件作为用户消息注入父会话（OMP 当前用 `deliverAs:"aside"`、`attribution:"agent"`）；注入成功不等于模型已处理。 |
 | 传输 | Transport | 消息请求的通信方式，如当前本机 loopback HTTP。MCP 是可选工具接入方式，当前 v1 子端协议不是 MCP。 |
 

@@ -21,10 +21,12 @@ The session id comes from an explicit ``--session-id`` or, when running inside
 the Codex chat, from ``CODEX_THREAD_ID`` / ``CODEX_SESSION_ID``.  No session id
 is hardcoded anywhere.
 
-Besides the core-compatible operations it offers the minimal RPC-child
-commands ``send-child`` (non-blocking parent request), ``child-status``
-(on-demand controller get_state) and ``stop-child``.  They reuse the same
-registry/SQLite ownership verification and the Pi RPC control client.
+It offers the minimal RPC-child commands ``child-status``
+(on-demand controller get_state) and ``stop-child``.  The non-blocking
+``send-child`` is a core CLI operation: the helper only resolves and verifies
+the binding, then calls the same ``agent_link.cli.cmd_send_child`` handler.
+All parent-side operations reuse the core handlers and the same
+registry/SQLite ownership verification.
 
 Examples::
 
@@ -54,7 +56,6 @@ from ...storage import (
     DB_FILENAME,
     Store,
     canonical_json,
-    require_text,
     validate_identifier,
 )
 
@@ -66,6 +67,7 @@ SESSION_ENV_VARS = ("CODEX_THREAD_ID", "CODEX_SESSION_ID")
 OPERATION_HANDLERS = {
     "reply": cli.cmd_reply,
     "ask-child": cli.cmd_ask_child,
+    "send-child": cli.cmd_send_child,
     "get-request": cli.cmd_get_request,
     "get-parent-request": cli.cmd_get_parent_request,
     "list-parent-requests": cli.cmd_list_parent_requests,
@@ -328,42 +330,6 @@ def _verify_store_row(row: dict, candidate: dict) -> None:
         )
 
 
-def _cmd_send_child(store: Store, binding: dict, args):
-    """Non-blocking parent request: persist, deliver, do not wait for a model."""
-    request_id = validate_identifier(args.request_id, "request_id")
-    message_id = validate_identifier(args.message_id, "message_id")
-    question = require_text(args.question, "question")
-    timeout = cli.parse_timeout(args.timeout)
-    prepared = store.prepare_parent_ask(binding["binding_id"], request_id, message_id, question, timeout)
-    request = prepared["request"]
-    error = None
-    if prepared["new"]:
-        _, error = cli.dispatch_parent_request(
-            store,
-            binding["binding_id"],
-            {
-                "kind": "ask_child",
-                "request_id": request_id,
-                "message_id": message_id,
-                "question": question,
-                "timeout_seconds": request["timeout_seconds"],
-                "deadline_epoch": request["deadline_epoch"],
-            },
-        )
-    row = store.get_parent_request(binding["binding_id"], request_id)
-    result = {
-        "binding_id": binding["binding_id"],
-        "request_id": request_id,
-        "message_id": message_id,
-        "status": row["status"],
-        "delivery_state": row["delivery_state"],
-        "idempotent": not prepared["new"],
-    }
-    if error:
-        result["error"] = error
-    return result, 0 if row["delivery_state"] == "host_accepted" else 7
-
-
 def _cmd_child_status(store: Store, binding: dict, args):
     """Read the Pi RPC descriptor and query the controller on demand."""
     result = {
@@ -428,9 +394,7 @@ def _run_operation(args, candidate: dict):
         _verify_store_row(row, candidate)
         namespace = argparse.Namespace(**vars(args))
         namespace.binding = candidate["binding_id"]
-        if args.command == "send-child":
-            result, exit_code = _cmd_send_child(store, row, namespace)
-        elif args.command == "child-status":
+        if args.command == "child-status":
             result, exit_code = _cmd_child_status(store, row, namespace)
         elif args.command == "stop-child":
             result, exit_code = _cmd_stop_child(store, row, namespace)

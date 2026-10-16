@@ -195,11 +195,67 @@ class HostDriver(Protocol):
 
 Pi 和 OMP 使用 session-owned loopback HTTP 接口，按权威 Binding 的框架/session_id 直接推送。接收扩展启动时注册，关闭或切换时清理；无文件桥、收件箱扫描或注册表定时发现。缺连接、错身份、超时均明确失败，不自动重发或降级。
 
-启动、认证、上限、语义与残留处理见 [SESSION-PUSH.md](SESSION-PUSH.md)。Pi 父端空闲启动/忙碌 followUp，OMP aside；OMP 子端 ask-child 同样推送，Pi 专用子端保持 [RPC](PI-RPC.md)。OpenCode 仍使用文件桥 watcher。
+启动、认证、上限、语义与残留处理见 [SESSION-PUSH.md](SESSION-PUSH.md)。Pi 父端空闲启动/忙碌 followUp，OMP aside；OMP 子端 ask-child 同样推送，Pi 专用子端保持 [RPC](PI-RPC.md)。OpenCode 不使用此 loopback 监听协议：Python 适配器直连框架原生 prompt 端点，契约见 §6.3；插件侧文件 watcher 已删除。
 
 ### 6.2 两种索引的职责
 
-Binding 注册表 `~/.agent-link/registry/` 记录任务会话关联，SQLite 仍是权威。Pi/OMP 会话连接目录 `~/.agent-link/sessions/`（AGENT_LINK_SESSIONS 可覆盖）只记录活跃扩展的 endpoint/token，不存消息；发送时按需查找，无需定时扫描。OpenCode 的旧 watcher 自动认领行为仍见其框架 README。
+Binding 注册表 `~/.agent-link/registry/` 记录任务会话关联，SQLite 仍是权威。Pi/OMP 会话连接目录 `~/.agent-link/sessions/`（AGENT_LINK_SESSIONS 可覆盖）只记录活跃扩展的 endpoint/token，不存消息；发送时按需查找，无需定时扫描。OpenCode 在该目录下使用独立的会话/serve 描述符（§6.3），同样按需读取；其旧 watcher 与自动认领已删除。
+
+### 6.3 OpenCode 描述符契约（契约冻结，实现跟随）
+
+OpenCode 走方案 (a)：宿主直连框架原生 `POST /api/session/<session_id>/prompt`（HTTP Basic `opencode:<password>`），不走 §6.1 的 `agent-link-push/1` 监听接口。拓扑决议：一 serve 一目标会话，serve 由集成自管，密码由集成以 `OPENCODE_SERVER_PASSWORD` 每 serve 生成，绝不复用用户 `service.json` 密码；attach 不声明支持，attach 路径禁止 password 入描述符。
+
+目录（`$AGENT_LINK_SESSIONS`，默认 `~/.agent-link/sessions`；目录 0700，文件 0600）：
+
+```text
+opencode/<session_id>.json           # 会话描述符：定位一个目标会话，不存密码
+opencode/servers/<serve_id>.json     # serve 描述符：密码唯一一份
+```
+
+会话描述符字段（JSON object）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `protocol` | string | 固定 `agent-link-opencode-push/1` |
+| `framework` | string | 固定 `opencode` |
+| `session_id` | string | 目标会话 id，与 Binding 一致 |
+| `endpoint` | string | 仅 `http://127.0.0.1:<port>` origin |
+| `pid` | int | serve 进程 pid，必须等于 serve 描述符的 pid 且进程存活 |
+| `serve_id` | string | 引用 `servers/<serve_id>.json` 的标识 |
+| `managed` | bool | 必须为 `true`；缺失/非 true（attach）适配器拒用 |
+| `credential_kind` | string | 会话侧固定 `server_descriptor` |
+
+serve 描述符字段：`protocol`/`framework`（同值）、`serve_id`（与会话引用的 id 一致）、`endpoint`（与会话描述符一致）、`pid`（与会话描述符一致且存活）、`managed=true`、`credential_kind="inline_password"`、`password`（集成生成，至少 16 字符）。
+
+读取方校验（失败即 `failed_or_unknown`，不发起请求、不降级到文件）：
+
+1. 两份描述符必须是私有普通文件（无 group/other 权限位）、JSON object，身份字段完全匹配。
+2. `managed` 必须为 true；缺失或非 true 视为 attach 路径，拒绝。
+3. `credential_kind` 只接受上表值；其他值（为后续 token 代理形态保留）fail closed。会话描述符出现 `password` 字段即拒绝（C2：密码只存 serve 描述符一份）。
+4. endpoint 仅接受 loopback HTTP origin（无 path/query/fragment/userinfo），禁用代理与重定向；会话与 serve 描述符的 endpoint、pid 必须一致。
+5. 每次投递重新读取两份描述符，不跨 run 或 delivery 缓存；密码轮换、serve 替换、pid 死亡立即生效。
+
+请求与失败映射：
+
+- 固定路由 `POST /api/session/<已校验 session_id>/prompt`，body `{"id": message_id, "text": 渲染后的 prompt, "delivery": "queue"}`；不发送 `resume`，调度遵循框架默认。
+- 只有上游 2xx 且响应 JSON 的 `sessionID` 回显与目标一致（若含 `id` 也必须等于 `message_id`）才记录 `host_accepted`。
+- 401：配置错误，不重试；404：目标会话不存在，`failed_or_unknown` 且不自动重发；其他非 2xx、超时、网络失败、响应身份不匹配：`failed_or_unknown`。仅同 `message_id`（原样作 prompt `id`）允许幂等重放，上游首条 admission 生效。
+- 密码与 Authorization 禁入日志、审计 detail 与异常文本（C3），并有模拟单测断言。
+
+能力声明：父端 `notification_transport=opencode_prompt_http`，子端 `delivery_transport=opencode_prompt_http`，`polling=false`，`delivery=queue`；`busy_behavior`/`wake_after_turn`/`wake_child` 与 `resume` 调度行为未经模型端验收，保持 `unknown`，不得宣称已验证。
+
+### 6.4 父→子消息：ask-child 与 send-child
+
+两个命令都由核心 CLI 提供，按权威 Binding 经 `prepare_parent_ask` 持久化同一行 `parent_requests`，再由 `dispatch_parent_request` 选择 `binding.child_framework` 的适配器投递（Pi RPC 或 session push、OMP session push、OpenCode 原生 prompt push，见 §6.1/§6.3）：
+
+| 命令 | 语义 | 退出码 |
+| --- | --- | --- |
+| `ask-child --binding B --request-id R --message-id M --question Q --timeout N` | 持久化+投递后阻塞等待 `answered`/`timed_out` | 0 answered / 3 timed_out / 4/5/6/7 |
+| `send-child --binding B --request-id R --message-id M --question Q --timeout N` | 只持久化+投递，不等子模型；适合父端“随时可达”地下发消息 | 0 host_accepted / 7 failed_or_unknown / 4/5/6 |
+
+- 两者共享幂等/冲突规则：同 `request_id` + 同 `message_id` + 同 question/timeout 为重放，不二次投递；同 `request_id` 不同 `message_id`/question/timeout，或同 `message_id` 已被其他 `request_id` 占用，返回冲突（exit 4）。先 `send-child` 后 `ask-child`（或反之）只投递一次，后者复用已有请求行等待。
+- 投递成功只记 `host_accepted`，不代表子模型已处理；答复仍由子端 `answer`（或框架工具）写入并以持久化行为为准。
+- 子端 busy/空闲时的实际可达性、OpenCode `delivery:"queue"` 的空闲唤醒与忙碌投递、serve 重启恢复均为 [推断]，保留 `unknown`；将在切片 3 的模型端到端验收（门禁 C）记录。`send-child` 只保证“已尝试投递且结果确定”，不保证忙碌子端立刻处理。
 
 ## 7. 子端扩展工具（Pi / OMP）
 
@@ -217,7 +273,7 @@ Binding 注册表 `~/.agent-link/registry/` 记录任务会话关联，SQLite �
 - 加载方式（启动步骤见 §2.2）：命令行 `--extension` 显式加载，或放入项目/用户扩展目录，或登记进 `~/.omp/agent/config.yml` 的 `extensions:`；不会自动读取任何父端配置或会话 ID（session id 由扩展从宿主运行时读取，见 §6.2 自动认领）。
 - OMP：五个工具保持；session_start 登记当前会话推送接口，父端通知和子端问题均调用 aside 注入，session_shutdown 清理。
 - Pi：四个工具保持；交互父端使用 session HTTP 推送，专用子端 RPC 使用 answer_parent 回答；都不扫描通知文件。
-- OpenCode：`extensions/opencode/agent-link.ts` 是 v2 插件（`{id, setup}`；`ctx.tool.transform` 注册五个子端工具，语义与 OMP 逐字一致；注入用 `ctx.session.prompt({delivery:"queue"})`）；watcher 复用同一共享模块（framework "opencode"，父子两角色；插件是 server 级，会话归属取最近活跃会话，多会话并发时为近似——见文件头注释）。父端驱动 `agent_link.hosts.opencode.parent:OpenCodeParentAdapter`（OmpHost 薄子类，同一文件桥）。本机 2.0.29 只接受 v2 插件形态（v1 工厂形态被拒绝）。
+- OpenCode：`extensions/opencode/agent-link.ts` 是 v2 插件（`{id, setup}`；`ctx.tool.transform` 注册五个子端工具，语义与 OMP 逐字一致）。父端驱动 `agent_link.hosts.opencode.parent:OpenCodeParentAdapter`，Python 父子适配器均直连原生 prompt 端点（§6.3），不写文件桥/收件箱；插件不再含 watcher、锁/游标或“最近活跃会话”自动认领。本机 2.0.29 只接受 v2 插件形态（v1 工厂形态被拒绝）。
 - Codex 子端：尚无适配器与 inbox watcher；`ask-child` 对它不会自动唤醒，不要承诺。Codex 作为父端的发现/回复见 [CODEX.md](CODEX.md)。
 
 ## 8. 测试与已验证 / 未验证
@@ -237,9 +293,10 @@ PI_CODING_AGENT_ROOT=<pi 包根> node tests/pi/extension_unit.test.mjs
 - `tests/test_pi_extension.py`：jiti 加载真实扩展 + fake `ExtensionAPI`；真实 `agent_link.host` + notifier stub（走旧 CLI `reply`）闭环：report/ask/get-request、超时后迟到答复、重启重放；`pi --help` 用探针扩展验证 Pi 真实加载扩展（无模型、无会话）。
 - `tests/pi/extension_unit.test.mjs`：原生工具与凭据校验，以及 HTTP 推送认证、身份、上限、失败、顺序和会话生命周期。
 - `tests/test_omp_host.py`、`tests/test_push.py`：主动推送客户端与宿主状态闭环、错身份、缺连接、禁止重定向、不自动重投。
+- `tests/test_opencode_push.py`：OpenCode 原生 prompt 推送（fake serve，无模型）：Basic 路由与 body、同 id 幂等重放、401 配置错误不重试、404/5xx/超时映射、描述符缺失/身份不匹配/未 managed/pid 死亡/非 loopback/重定向拒绝、描述符每次重读、密码不入异常/日志/审计。
 - `tests/test_omp_extension.py`：真实 OMP 扩展的模拟上下文与本地 HTTP 注入，以及无模型注册；共享接收逻辑与 Pi 同源。
-- `tests/test_parent_requests.py`：请求/答复状态、幂等、冲突、超时与迟到；OpenCode inbox 仍有专门覆盖。
+- `tests/test_parent_requests.py`：请求/答复状态、幂等、冲突、超时与迟到；OpenCode prompt 推送闭环仍有专门覆盖。
 - `tests/test_codex.py`、`tests/test_registry.py`：父端发现、归属校验和注册表行为。
-- `tests/test_opencode_extension.py`：OpenCode v2 工具、文件 watcher 与隔离环境注册。
+- `tests/test_opencode_extension.py`：OpenCode v2 工具、原生 prompt 推送宿主闭环与隔离环境插件注册（已删除 watcher 套件）。
 
-当前测试矩阵和真实模型证据以 [SESSION-PUSH](SESSION-PUSH.md)、[PI-RPC](PI-RPC.md) 与各框架 README 为准。历史文件桥验收不等于主动推送验收。Pi/OMP 正式扩展已通过真实 DeepSeek 的空闲通知和 ask/reply 闭环；工具运行中的消息注入已由真实模型验证；计划模式、中断竞争、会话切换、重连仍需分别验证。OpenCode 保持原文件 watcher；Codex 子端未实现。
+当前测试矩阵和真实模型证据以 [SESSION-PUSH](SESSION-PUSH.md)、[PI-RPC](PI-RPC.md) 与各框架 README 为准。历史文件桥验收不等于主动推送验收。Pi/OMP 正式扩展已通过真实 DeepSeek 的空闲通知和 ask/reply 闭环；工具运行中的消息注入已由真实模型验证；计划模式、中断竞争、会话切换、重连仍需分别验证。OpenCode 的 Python 推送目前只有模拟测试（§6.3 契约、A/B 组门禁的模拟部分），插件 watcher 已删除；真实隔离 serve 测试与模型端到端（C 组）未做；Codex 子端未实现。

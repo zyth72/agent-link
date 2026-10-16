@@ -1,8 +1,9 @@
-"""Parent -> child channel tests (ask-child/answer CLI, inbox bridge, service ops)."""
+"""Parent -> child channel tests (ask-child/answer CLI, OpenCode prompt push, service ops)."""
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -14,9 +15,9 @@ import urllib.request
 from pathlib import Path
 
 from agent_link.host import HostService
-from agent_link.shared import inbox_path
 from agent_link.storage import Store
 from tests import isolate_registry
+from tests.opencode_server import MockOpenCodeServe, write_descriptor_pair
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -30,14 +31,25 @@ class StubDriver:
 
 
 class ParentChildCliCase(unittest.TestCase):
-    """CLI closed loop for the legacy inbox child (OpenCode): ask-child writes
-    the inbox; the child answers via the ordinary CLI."""
+    """CLI closed loop for the OpenCode child: ask-child pushes one prompt
+    through the native OpenCode HTTP endpoint; the child answers via the
+    ordinary CLI.  No file inbox is written."""
 
     def setUp(self):
         isolate_registry(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name) / "runtime"
+        self.sessions = Path(self.tmp.name) / "sessions"
+        previous = os.environ.get("AGENT_LINK_SESSIONS")
+        os.environ["AGENT_LINK_SESSIONS"] = str(self.sessions)
+
+        def restore_env():
+            os.environ.pop("AGENT_LINK_SESSIONS", None)
+            if previous is not None:
+                os.environ["AGENT_LINK_SESSIONS"] = previous
+
+        self.addCleanup(restore_env)
         self.notifier = Path(self.tmp.name) / "stub.py"
         self.notifier.write_text("def bridge(payload):\n    return {'accepted': True}\n", encoding="utf-8")
         self.binding = "pc-b"
@@ -53,7 +65,9 @@ class ParentChildCliCase(unittest.TestCase):
         config_path.write_text(json.dumps(config), encoding="utf-8")
         proc = self.run_cli("bind", "--config", str(config_path))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.inbox = inbox_path(self.root, self.binding)
+        self.serve = MockOpenCodeServe("child-1")
+        self.addCleanup(self.serve.close)
+        write_descriptor_pair(self.sessions, self.serve)
 
     def run_cli(self, *args, timeout=60):
         return subprocess.run(
@@ -111,37 +125,47 @@ class ParentChildCliCase(unittest.TestCase):
             answer,
         )
 
-    def read_inbox(self):
-        if not self.inbox.exists():
-            return []
-        return [json.loads(line) for line in self.inbox.read_text("utf-8").splitlines() if line.strip()]
+    def send_child(self, request_id, message_id, question, timeout):
+        return self.run_cli(
+            "send-child",
+            "--binding",
+            self.binding,
+            "--request-id",
+            request_id,
+            "--message-id",
+            message_id,
+            "--question",
+            question,
+            "--timeout",
+            str(timeout),
+        )
 
-    def wait_for_inbox(self, count: int, timeout: float = 10) -> list[dict]:
+    def read_prompts(self):
+        return list(self.serve.prompts)
+
+    def wait_for_prompts(self, count: int, timeout: float = 10) -> list[dict]:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            events = self.read_inbox()
-            if len(events) >= count:
-                return events
+            prompts = self.read_prompts()
+            if len(prompts) >= count:
+                return prompts
             time.sleep(0.05)
-        return self.read_inbox()
+        return self.read_prompts()
 
     def test_ask_child_closed_loop(self):
         asker = self.start_ask_child("rq-1", "pm-1", "which option?", 30)
-        events = self.wait_for_inbox(1)
-        self.assertEqual(len(events), 1, "ask-child must append one inbox event before waiting")
-        event = events[0]
-        self.assertEqual(event["v"], 1)
-        self.assertEqual(event["kind"], "ask_child")
-        self.assertEqual(event["binding_id"], self.binding)
-        self.assertEqual(event["source"], "parent-cli")
-        self.assertEqual(event["parent_session_id"], "parent-1")
-        self.assertEqual(event["child_framework"], "opencode")
-        self.assertEqual(event["child_session_id"], "child-1")
-        self.assertEqual(event["request_id"], "rq-1")
-        self.assertEqual(event["message_id"], "pm-1")
-        self.assertIn("[agent-link:parent-ask]", event["prompt"])
-        self.assertIn("which option?", event["prompt"])
-        self.assertIn("answer --binding", event["prompt"])
+        prompts = self.wait_for_prompts(1)
+        self.assertEqual(len(prompts), 1, "ask-child must push one prompt before waiting")
+        prompt = prompts[0]
+        self.assertEqual(prompt["id"], "pm-1")
+        self.assertEqual(prompt["delivery"], "queue")
+        self.assertIn("[agent-link:parent-ask]", prompt["text"])
+        self.assertIn("binding_id: pc-b", prompt["text"])
+        self.assertIn("request_id: rq-1", prompt["text"])
+        self.assertIn("child: opencode/child-1", prompt["text"])
+        self.assertIn("which option?", prompt["text"])
+        self.assertIn("answer --binding", prompt["text"])
+        self.assertFalse((self.root / "inbox").exists(), "no inbox fallback")
 
         proc = self.answer("rq-1", "am-1", "option A")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -182,7 +206,7 @@ class ParentChildCliCase(unittest.TestCase):
 
     def test_replay_and_conflicts(self):
         asker = self.start_ask_child("rq-c", "pm-c", "pick", 30)
-        self.assertEqual(len(self.wait_for_inbox(1)), 1)
+        self.assertEqual(len(self.wait_for_prompts(1)), 1)
         self.assertEqual(self.answer("rq-c", "am-c", "A").returncode, 0)
         out, err = asker.communicate(timeout=30)
         self.assertEqual(asker.returncode, 0, err)
@@ -205,7 +229,7 @@ class ParentChildCliCase(unittest.TestCase):
         self.assertTrue(result["idempotent"])
         self.assertEqual(result["status"], "answered")
         self.assertEqual(result["answer"], "A")
-        self.assertEqual(len(self.read_inbox()), 1, "a replay must not re-append the inbox event")
+        self.assertEqual(len(self.read_prompts()), 1, "a replay must not re-push the prompt")
 
         changed = self.run_cli(
             "ask-child",
@@ -250,14 +274,111 @@ class ParentChildCliCase(unittest.TestCase):
         cross = self.answer("rq-c2", "am-c", "A")
         self.assertEqual(cross.returncode, 4, "one answer message cannot answer two requests")
 
+    def test_send_child_is_non_blocking_idempotent_and_not_waiting(self):
+        started = time.time()
+        proc = self.send_child("rq-s", "pm-s", "fire and forget", 30)
+        elapsed = time.time() - started
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["delivery_state"], "host_accepted")
+        self.assertEqual(result["status"], "pending")
+        self.assertFalse(result["idempotent"])
+        self.assertNotIn("answer", result, "send-child must not wait for an answer")
+        self.assertLess(elapsed, 15, "send-child must return without waiting for the reply")
+        prompts = self.wait_for_prompts(1)
+        self.assertEqual(len(prompts), 1, "send-child must push exactly one prompt")
+        self.assertEqual(prompts[0]["id"], "pm-s")
+        self.assertEqual(prompts[0]["delivery"], "queue")
+        self.assertIn("[agent-link:parent-ask]", prompts[0]["text"])
+        self.assertIn("fire and forget", prompts[0]["text"])
+
+        replay = self.send_child("rq-s", "pm-s", "fire and forget", 30)
+        self.assertEqual(replay.returncode, 0, replay.stdout + replay.stderr)
+        replay_result = json.loads(replay.stdout)
+        self.assertTrue(replay_result["idempotent"])
+        self.assertEqual(replay_result["delivery_state"], "host_accepted")
+        self.assertEqual(len(self.read_prompts()), 1, "a replay must not re-push the prompt")
+
+        answered = self.answer("rq-s", "am-s", "done")
+        self.assertEqual(answered.returncode, 0, answered.stderr)
+        after = self.send_child("rq-s", "pm-s", "fire and forget", 30)
+        self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
+        after_result = json.loads(after.stdout)
+        self.assertTrue(after_result["idempotent"])
+        self.assertEqual(after_result["status"], "answered")
+        self.assertEqual(len(self.read_prompts()), 1)
+
+    def test_send_child_delivery_failure_is_exit_7_without_redispatch(self):
+        (self.sessions / "opencode" / "child-1.json").unlink()
+        proc = self.send_child("rq-f", "pm-f", "nobody home", 30)
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["delivery_state"], "failed_or_unknown")
+        self.assertFalse(result["idempotent"])
+        self.assertIn("error", result)
+        self.assertEqual(self.serve.requests, [], "a missing descriptor must not be contacted")
+        self.assertFalse((self.root / "inbox").exists(), "no inbox fallback")
+
+        replay = self.send_child("rq-f", "pm-f", "nobody home", 30)
+        self.assertEqual(replay.returncode, 7)
+        replay_result = json.loads(replay.stdout)
+        self.assertTrue(replay_result["idempotent"])
+        self.assertEqual(replay_result["delivery_state"], "failed_or_unknown")
+        self.assertNotIn("error", replay_result, "a replay must not re-dispatch")
+
+    def test_send_child_then_ask_child_shares_one_dispatch(self):
+        sent = self.send_child("rq-sa", "pm-sa", "shared question", 30)
+        self.assertEqual(sent.returncode, 0, sent.stdout + sent.stderr)
+        self.assertEqual(len(self.wait_for_prompts(1)), 1)
+
+        asker = self.start_ask_child("rq-sa", "pm-sa", "shared question", 30)
+        time.sleep(0.3)
+        self.assertEqual(
+            len(self.read_prompts()), 1, "ask-child replay must not re-dispatch"
+        )
+        answered = self.answer("rq-sa", "am-sa", "shared answer")
+        self.assertEqual(answered.returncode, 0, answered.stderr)
+        out, err = asker.communicate(timeout=30)
+        self.assertEqual(asker.returncode, 0, err)
+        ask_result = json.loads(out)
+        self.assertTrue(ask_result["idempotent"])
+        self.assertEqual(ask_result["status"], "answered")
+        self.assertEqual(ask_result["answer"], "shared answer")
+        self.assertEqual(ask_result["delivery_state"], "host_accepted")
+        self.assertEqual(len(self.read_prompts()), 1)
+
+    def test_ask_child_then_send_child_replay_and_conflicts(self):
+        asker = self.start_ask_child("rq-as", "pm-as", "pick", 30)
+        self.assertEqual(len(self.wait_for_prompts(1)), 1)
+
+        replay = self.send_child("rq-as", "pm-as", "pick", 30)
+        self.assertEqual(replay.returncode, 0, replay.stdout + replay.stderr)
+        replay_result = json.loads(replay.stdout)
+        self.assertTrue(replay_result["idempotent"])
+        self.assertEqual(replay_result["status"], "pending")
+        self.assertEqual(replay_result["delivery_state"], "host_accepted")
+        self.assertEqual(len(self.read_prompts()), 1, "send-child replay must not re-dispatch")
+
+        self.assertEqual(self.send_child("rq-as", "pm-other", "pick", 30).returncode, 4)
+        self.assertEqual(self.send_child("rq-as", "pm-as", "different", 30).returncode, 4)
+        self.assertEqual(self.send_child("rq-as", "pm-as", "pick", 5).returncode, 4)
+        self.assertEqual(self.send_child("rq-other", "pm-as", "another", 30).returncode, 4)
+        self.assertEqual(len(self.read_prompts()), 1)
+
+        answered = self.answer("rq-as", "am-as", "A")
+        self.assertEqual(answered.returncode, 0, answered.stderr)
+        out, err = asker.communicate(timeout=30)
+        self.assertEqual(asker.returncode, 0, err)
+        self.assertEqual(json.loads(out)["status"], "answered")
+
     def test_list_parent_requests_pending(self):
         asker = self.start_ask_child("rq-a", "pm-a", "?", 30)
-        self.assertEqual(len(self.wait_for_inbox(1)), 1)
+        self.assertEqual(len(self.wait_for_prompts(1)), 1)
         self.answer("rq-a", "am-a", "ok")
         asker.communicate(timeout=30)
 
         pending = self.start_ask_child("rq-p", "pm-p", "?", 30)
-        self.assertEqual(len(self.wait_for_inbox(2)), 2)
+        self.assertEqual(len(self.wait_for_prompts(2)), 2)
 
         listed = self.run_cli("list-parent-requests", "--binding", self.binding, "--pending")
         self.assertEqual(listed.returncode, 0, listed.stderr)

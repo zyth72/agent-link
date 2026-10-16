@@ -27,11 +27,16 @@ from unittest import mock
 from agent_link.errors import ConflictError, DeliveryFailure, NotFoundError, ValidationError
 from agent_link.hosts.pi import rpc as pi_rpc
 from agent_link.hosts.pi.child import PiChildAdapter
-from agent_link.shared import inbox_path
 from agent_link.storage import Store
 from tests import isolate_registry
+from tests.opencode_server import MockOpenCodeServe, write_descriptor_pair
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def legacy_inbox_path(root, binding_id) -> Path:
+    """Path the removed legacy inbox used to write; it must never reappear."""
+    return Path(root) / "inbox" / f"{binding_id}.jsonl"
 FAKE_PI = REPO_ROOT / "tests" / "pi" / "fake_rpc_pi.py"
 EXTENSION = REPO_ROOT / "extensions" / "pi" / "agent-link.ts"
 CORE_CLI = [sys.executable, "-m", "agent_link"]
@@ -323,7 +328,7 @@ class PiRpcCase(unittest.TestCase):
         }
         with self.assertRaises(DeliveryFailure):
             PiChildAdapter().deliver(self.root, binding, message)
-        self.assertFalse(inbox_path(self.root, self.binding_id).exists())
+        self.assertFalse(legacy_inbox_path(self.root, self.binding_id).exists())
         path.unlink()
 
     # -- protocol framing ---------------------------------------------
@@ -628,7 +633,7 @@ class PiRpcCase(unittest.TestCase):
             message="rpc prompt",
         )
         self.assertFalse(
-            inbox_path(self.root, self.binding_id).exists(),
+            legacy_inbox_path(self.root, self.binding_id).exists(),
             "a valid descriptor must not produce an inbox event",
         )
         prompt = [cmd for cmd in self.fake_commands() if cmd.get("type") == "prompt"][-1]
@@ -688,7 +693,7 @@ class PiRpcCase(unittest.TestCase):
         self.assertIn("[agent-link:parent-ask]", event["prompt"])
         self.assertIn("request_id: rq-push", event["prompt"])
         self.assertFalse(
-            inbox_path(self.root, self.binding_id).exists(),
+            legacy_inbox_path(self.root, self.binding_id).exists(),
             "the push fallback must not write an inbox file",
         )
         answered = self.run_core(
@@ -731,16 +736,29 @@ class PiRpcCase(unittest.TestCase):
             store.close()
         self.assertEqual(row["delivery_state"], "failed_or_unknown")
         self.assertIn("protocol", row["delivery_detail"])
-        self.assertFalse(inbox_path(self.root, self.binding_id).exists())
+        self.assertFalse(legacy_inbox_path(self.root, self.binding_id).exists())
 
-    def test_ask_child_other_framework_still_uses_inbox(self):
-        # OpenCode is the remaining legacy inbox child; OMP now uses the
-        # session-owned push listener instead of an inbox file.
+    def test_ask_child_other_framework_uses_opencode_push(self):
+        # OpenCode children use the native prompt HTTP push; no inbox file is
+        # written for any framework anymore.
         store = Store(self.root)
         try:
             self._bind(store, "oc-b", "opencode", "oc-child")
         finally:
             store.close()
+        sessions = self.base / "oc-sessions"
+        previous = os.environ.get("AGENT_LINK_SESSIONS")
+        os.environ["AGENT_LINK_SESSIONS"] = str(sessions)
+
+        def restore_env():
+            os.environ.pop("AGENT_LINK_SESSIONS", None)
+            if previous is not None:
+                os.environ["AGENT_LINK_SESSIONS"] = previous
+
+        self.addCleanup(restore_env)
+        serve = MockOpenCodeServe("oc-child")
+        self.addCleanup(serve.close)
+        write_descriptor_pair(sessions, serve)
         asker = subprocess.Popen(
             CORE_CLI
             + [
@@ -755,11 +773,16 @@ class PiRpcCase(unittest.TestCase):
             env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
         )
         self.processes.append(asker)
-        inbox = inbox_path(self.root, "oc-b")
-        self.wait_for(lambda: inbox.exists(), message="opencode inbox event")
-        event = json.loads(inbox.read_text("utf-8").splitlines()[0])
-        self.assertEqual(event["kind"], "ask_child")
-        self.assertEqual(event["child_framework"], "opencode")
+        self.wait_for(lambda: len(serve.prompts) == 1, message="opencode push prompt")
+        prompt = serve.prompts[0]
+        self.assertEqual(prompt["id"], "pm-oc")
+        self.assertEqual(prompt["delivery"], "queue")
+        self.assertIn("[agent-link:parent-ask]", prompt["text"])
+        self.assertIn("request_id: rq-oc", prompt["text"])
+        self.assertFalse(
+            legacy_inbox_path(self.root, "oc-b").exists(),
+            "OpenCode push must not write an inbox file",
+        )
         answered = self.run_core(
             "answer", "--binding", "oc-b", "--request-id", "rq-oc",
             "--message-id", "am-oc", "--answer", "ok",

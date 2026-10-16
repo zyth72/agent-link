@@ -55,9 +55,11 @@ CAPABILITIES = {
             "cancel": False,
         },
         "opencode": {
-            "notification_transport": "session_bridge_file",
+            "notification_transport": "opencode_prompt_http",
             "receive_mode": "session_injection",
             "reply_mode": "blocking_tool_file_poll",
+            "polling": False,
+            "delivery": "queue",
             "busy_behavior": "unknown",
             "wake_after_turn": "unknown",
             "spawn": False,
@@ -113,9 +115,11 @@ def dispatch_parent_request(store: Store, binding_id: str, message: dict):
 
     Mirrors _dispatch for the parent->child direction: the transport is chosen
     by ``binding.child_framework`` (Pi uses the RPC descriptor when present,
-    otherwise the legacy inbox; OMP/OpenCode use the inbox).  ``host_accepted``
-    only proves the transport accepted the message, never that the model
-    processed it.  A replay never re-appends (the caller checks new).
+    otherwise the session push listener; OMP uses the session push listener;
+    OpenCode pushes to its native prompt endpoint through the frozen session
+    descriptor).  ``host_accepted`` only proves the transport accepted the
+    message, never that the model processed it.  A replay never re-dispatches
+    (the caller checks new).
     """
     store.mark_parent_dispatching(binding_id, message["request_id"])
     try:
@@ -325,6 +329,53 @@ def cmd_ask_child(store: Store, args) -> tuple[dict, int]:
     return result, 0 if final["status"] == "answered" else 3
 
 
+def cmd_send_child(store: Store, args) -> tuple[dict, int]:
+    """Persist and deliver a parent request without waiting for the child model.
+
+    Same persistence and dispatch path as :func:`cmd_ask_child`, but the
+    command returns as soon as the transport call finishes: ``host_accepted``
+    maps to exit 0 and ``failed_or_unknown`` to exit 7.  This is the
+    "message the child any time" operation; whether a busy or idle child model
+    actually processes it follows the child framework's native scheduling and
+    is not proven by the transport acceptance.  A replay with the same
+    request_id/message_id never dispatches twice and reports the persisted
+    request row instead.
+    """
+    binding_id = validate_identifier(args.binding, "binding_id")
+    request_id = validate_identifier(args.request_id, "request_id")
+    message_id = validate_identifier(args.message_id, "message_id")
+    question = require_text(args.question, "question")
+    timeout = parse_timeout(args.timeout)
+    prepared = store.prepare_parent_ask(binding_id, request_id, message_id, question, timeout)
+    request = prepared["request"]
+    error = None
+    if prepared["new"]:
+        _, error = dispatch_parent_request(
+            store,
+            binding_id,
+            {
+                "kind": "ask_child",
+                "request_id": request_id,
+                "message_id": message_id,
+                "question": question,
+                "timeout_seconds": request["timeout_seconds"],
+                "deadline_epoch": request["deadline_epoch"],
+            },
+        )
+    row = store.get_parent_request(binding_id, request_id)
+    result = {
+        "binding_id": binding_id,
+        "request_id": request_id,
+        "message_id": message_id,
+        "status": row["status"],
+        "delivery_state": row["delivery_state"],
+        "idempotent": not prepared["new"],
+    }
+    if error:
+        result["error"] = error
+    return result, 0 if row["delivery_state"] == "host_accepted" else 7
+
+
 def cmd_answer(store: Store, args) -> tuple[dict, int]:
     binding_id = validate_identifier(args.binding, "binding_id")
     request_id = validate_identifier(args.request_id, "request_id")
@@ -397,6 +448,7 @@ HANDLERS = {
     "reply": cmd_reply,
     "get-request": cmd_get_request,
     "ask-child": cmd_ask_child,
+    "send-child": cmd_send_child,
     "answer": cmd_answer,
     "get-parent-request": cmd_get_parent_request,
     "list-parent-requests": cmd_list_parent_requests,
@@ -441,7 +493,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "ask-child",
-        help="parent asks the bound child and waits for its answer (writes the child inbox)",
+        help="parent asks the bound child and waits for its answer (blocks; child transport)",
+    )
+    p.add_argument("--binding", required=True)
+    p.add_argument("--request-id", required=True, dest="request_id")
+    p.add_argument("--message-id", required=True, dest="message_id")
+    p.add_argument("--question", required=True)
+    p.add_argument("--timeout", required=True)
+
+    p = sub.add_parser(
+        "send-child",
+        help="persist and deliver a parent request without waiting for the child's answer",
     )
     p.add_argument("--binding", required=True)
     p.add_argument("--request-id", required=True, dest="request_id")

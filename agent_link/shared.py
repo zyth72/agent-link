@@ -1,65 +1,27 @@
-"""Framework-neutral prompt renderers and JSONL bridge-file helpers.
+"""Framework-neutral prompt renderers.
 
 Every host adapter shares this module for the basics: rendering a notification
-for a parent session or a parent-initiated question for a child session, and
-the atomic ``flock`` + ``fsync`` JSONL append used by parent bridge files and
-the legacy child inbox.  No framework adapter may import another framework's
-directory (Codex/OMP/Pi/OpenCode) for these shared behaviors.
+for a parent session or a parent-initiated question for a child session.  No
+framework adapter may import another framework's directory (Codex/OMP/Pi/
+OpenCode) for these shared behaviors.
 
-The bridge file and inbox are wake-up transports only: an accepted append
-proves the event is readable by the session watcher, never that the model
-processed it.  Request and answer state lives in the root's SQLite database.
+The former JSONL bridge-file and inbox helpers were removed together with the
+OpenCode plugin watcher (de-polling slice 2).  Message transport now lives in
+the framework adapters: Pi/OMP session push, Pi RPC and the OpenCode native
+prompt endpoint (see docs/HOST-PROTOCOL.md).  An accepted transport call
+proves the host accepted the message, never that the model processed it;
+request and answer state lives in the root's SQLite database.
 """
 
 from __future__ import annotations
 
-import fcntl
-import json
-import os
 import shlex
 from datetime import datetime, timezone
 from pathlib import Path
 
-EVENT_VERSION = 1
-#: Parent notification bridge directory (shared by the OMP/Pi/OpenCode watchers).
-PARENT_BRIDGE_DIR_NAME = "omp-bridge"
-#: Legacy parent -> child wake-up directory (no longer used by Pi RPC).
-INBOX_DIR_NAME = "inbox"
-
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
-def append_event(target: Path, event: dict) -> None:
-    """Append one JSONL event, atomically and durably, in a single ``flock``.
-
-    The file is created 0600 inside its parent directory.  POSIX only: the
-    O_APPEND + flock pair is what keeps concurrent writers from interleaving.
-    """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    line = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        view = memoryview(line)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError("write returned 0 bytes")
-            view = view[written:]
-        os.fsync(fd)
-    finally:
-        # Closing the descriptor releases the lock.
-        os.close(fd)
-
-
-def parent_bridge_path(root, binding_id) -> Path:
-    return Path(root) / PARENT_BRIDGE_DIR_NAME / f"{binding_id}.jsonl"
-
-
-def inbox_path(root, binding_id) -> Path:
-    return Path(root) / INBOX_DIR_NAME / f"{binding_id}.jsonl"
 
 
 def build_parent_prompt(root, binding: dict, message: dict) -> str:
@@ -106,8 +68,8 @@ def build_parent_prompt(root, binding: dict, message: dict) -> str:
 def build_child_prompt(root, binding: dict, message: dict) -> str:
     """Framework-neutral parent-initiated question renderer.
 
-    Used by the Pi RPC transport and the legacy inbox; the Pi child adapter
-    sends the returned text through the RPC ``prompt`` command.
+    Used by the Pi RPC transport, the Pi/OMP session push transport and the
+    OpenCode native prompt transport.
     """
     root_arg = shlex.quote(str(Path(root).resolve()))
     lines = [
@@ -131,56 +93,3 @@ def build_child_prompt(root, binding: dict, message: dict) -> str:
         ),
     ]
     return "\n".join(lines)
-
-
-def build_parent_bridge_event(root, binding: dict, message: dict, *, source="service") -> dict:
-    """One parent-notification bridge event (same schema for every framework)."""
-    event = {
-        "v": EVENT_VERSION,
-        "ts": utc_now_iso(),
-        "source": source,
-        "binding_id": binding["binding_id"],
-        "thread_id": binding["parent_session_id"],
-        "parent_framework": binding["parent_framework"],
-        "child_framework": binding["child_framework"],
-        "child_session_id": binding["child_session_id"],
-        "kind": message["kind"],
-        "message_id": message["message_id"],
-        "prompt": build_parent_prompt(root, binding, message),
-    }
-    if message["kind"] == "ask":
-        event["request_id"] = message["request_id"]
-    return event
-
-
-def build_inbox_event(root, binding: dict, message: dict) -> dict:
-    event = {
-        "v": EVENT_VERSION,
-        "ts": utc_now_iso(),
-        "source": "parent-cli",
-        "binding_id": binding["binding_id"],
-        "parent_framework": binding["parent_framework"],
-        "parent_session_id": binding["parent_session_id"],
-        "child_framework": binding["child_framework"],
-        "child_session_id": binding["child_session_id"],
-        "kind": message["kind"],
-        "message_id": message["message_id"],
-        "prompt": build_child_prompt(root, binding, message),
-    }
-    if message["kind"] == "ask_child":
-        event["request_id"] = message["request_id"]
-    return event
-
-
-def append_parent_bridge(root, binding: dict, message: dict, *, source="service") -> str:
-    """Append one parent notification event; raises OSError on write failure."""
-    target = parent_bridge_path(root, binding["binding_id"])
-    append_event(target, build_parent_bridge_event(root, binding, message, source=source))
-    return f"{PARENT_BRIDGE_DIR_NAME}:{target}#{message['message_id']}"
-
-
-def append_inbox(root, binding: dict, message: dict) -> str:
-    """Append one legacy parent -> child event; raises OSError on write failure."""
-    target = inbox_path(root, binding["binding_id"])
-    append_event(target, build_inbox_event(root, binding, message))
-    return f"{INBOX_DIR_NAME}:{target}#{message['message_id']}"

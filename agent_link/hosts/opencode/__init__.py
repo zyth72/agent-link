@@ -1,4 +1,4 @@
-"""OpenCode adapters: bridge-file parent and legacy inbox child."""
+"""OpenCode adapters: native prompt HTTP push for parent and child roles."""
 from ..base import HostAdapters
 from .child import OpenCodeChildAdapter
 from .parent import OpenCodeParentAdapter

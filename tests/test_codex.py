@@ -1,7 +1,8 @@
 """Codex parent helper tests: registry discovery, ownership checks, closed loops.
 
 Everything is local and simulated: stub notifiers record ``bridge()`` calls
-and the child inbox is a file.  No desktop message is ever sent.
+and the OpenCode child is a fake HTTP serve.  No desktop message is ever sent
+and no model is called.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from agent_link.hosts.codex.parent import CodexParentAdapter, build_codex_parent
 from agent_link.shared import build_parent_prompt
 from agent_link.storage import Store
 from tests import isolate_registry
+from tests.opencode_server import MockOpenCodeServe, write_descriptor_pair
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WRAPPER = REPO_ROOT / "skills" / "agent-link" / "scripts" / "link.py"
@@ -149,6 +151,27 @@ class CodexCase(unittest.TestCase):
 
         self.addCleanup(cleanup)
         return proc
+
+    def opencode_child(self, name, child_session):
+        """Start a fake OpenCode serve and write its descriptors for one test.
+
+        Points AGENT_LINK_SESSIONS at a per-test directory so subprocesses
+        inherit it through ``base_env()``; returns the fake serve.
+        """
+        sessions = self.work / f"{name}-sessions"
+        previous = os.environ.get("AGENT_LINK_SESSIONS")
+        os.environ["AGENT_LINK_SESSIONS"] = str(sessions)
+
+        def restore_env():
+            os.environ.pop("AGENT_LINK_SESSIONS", None)
+            if previous is not None:
+                os.environ["AGENT_LINK_SESSIONS"] = previous
+
+        self.addCleanup(restore_env)
+        serve = MockOpenCodeServe(child_session)
+        self.addCleanup(serve.close)
+        write_descriptor_pair(sessions, serve)
+        return serve
 
     def write_registry_entry(self, binding_id, **overrides):
         entry = {
@@ -494,6 +517,7 @@ class CodexCase(unittest.TestCase):
 
     def test_ask_child_closed_loop_with_simulated_child(self):
         root, _ = self.bind("b-askchild", child_framework="opencode", child_session="child-oc")
+        serve = self.opencode_child("askchild", "child-oc")
         asker = self.popen_codex(
             "--session-id",
             "session-1",
@@ -510,14 +534,17 @@ class CodexCase(unittest.TestCase):
             "30",
         )
         self.add_process_cleanup(asker)
-        inbox = root / "inbox" / "b-askchild.jsonl"
-        text = self.wait_for_file_text(inbox)
-        self.assertTrue(text.strip(), "ask-child must append the inbox event before waiting")
-        event = json.loads(text.splitlines()[0])
-        self.assertEqual(event["kind"], "ask_child")
-        self.assertEqual(event["request_id"], "rq-c")
-        self.assertIn("[agent-link:parent-ask]", event["prompt"])
-        self.assertIn("answer --binding", event["prompt"])
+        deadline = time.time() + 10
+        while time.time() < deadline and not serve.prompts:
+            time.sleep(0.05)
+        self.assertTrue(serve.prompts, "ask-child must push one prompt before waiting")
+        prompt = serve.prompts[0]
+        self.assertEqual(prompt["id"], "pm-c")
+        self.assertEqual(prompt["delivery"], "queue")
+        self.assertIn("[agent-link:parent-ask]", prompt["text"])
+        self.assertIn("request_id: rq-c", prompt["text"])
+        self.assertIn("answer --binding", prompt["text"])
+        self.assertFalse((root / "inbox").exists(), "no inbox fallback")
 
         answered = self.run_core(
             "answer",
@@ -572,6 +599,71 @@ class CodexCase(unittest.TestCase):
         )
         self.assertEqual(timed_out.returncode, 3, timed_out.stderr)
         self.assertEqual(self.payload(timed_out)["status"], "timed_out")
+
+    def test_send_child_closed_loop_reuses_core_handler(self):
+        root, _ = self.bind("b-sendchild", child_framework="opencode", child_session="child-sc")
+        serve = self.opencode_child("sendchild", "child-sc")
+        send_args = (
+            "--session-id", "session-1", "--binding", "b-sendchild", "send-child",
+            "--request-id", "rq-s", "--message-id", "pm-s", "--question", "status?",
+            "--timeout", "30",
+        )
+
+        sent = self.run_codex(*send_args, timeout=30)
+        self.assertEqual(sent.returncode, 0, sent.stdout + sent.stderr)
+        payload = self.payload(sent)
+        self.assertEqual(payload["delivery_state"], "host_accepted")
+        self.assertEqual(payload["status"], "pending")
+        self.assertFalse(payload["idempotent"])
+        deadline = time.time() + 10
+        while time.time() < deadline and not serve.prompts:
+            time.sleep(0.05)
+        self.assertEqual(len(serve.prompts), 1, "send-child must push one prompt")
+        self.assertEqual(serve.prompts[0]["id"], "pm-s")
+        self.assertIn("status?", serve.prompts[0]["text"])
+
+        replay = self.run_codex(*send_args, timeout=30)
+        self.assertEqual(replay.returncode, 0, replay.stdout + replay.stderr)
+        self.assertTrue(self.payload(replay)["idempotent"])
+        self.assertEqual(len(serve.prompts), 1, "the helper replay must not re-push")
+
+        answered = self.run_core(
+            "answer", "--binding", "b-sendchild", "--request-id", "rq-s",
+            "--message-id", "am-s", "--answer", "all good", root=root,
+        )
+        self.assertEqual(answered.returncode, 0, answered.stderr)
+        after = self.run_codex(*send_args, timeout=30)
+        self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
+        after_payload = self.payload(after)
+        self.assertTrue(after_payload["idempotent"])
+        self.assertEqual(after_payload["status"], "answered")
+        self.assertEqual(len(serve.prompts), 1)
+
+        conflict = self.run_codex(
+            "--session-id", "session-1", "--binding", "b-sendchild", "send-child",
+            "--request-id", "rq-conflict", "--message-id", "pm-s", "--question", "reuse",
+            "--timeout", "30", timeout=30,
+        )
+        self.assertEqual(conflict.returncode, 4, conflict.stdout + conflict.stderr)
+
+    def test_send_child_delivery_failure_maps_to_exit_7(self):
+        self.bind("b-sendfail", child_framework="opencode", child_session="child-missing")
+        send_args = (
+            "--session-id", "session-1", "--binding", "b-sendfail", "send-child",
+            "--request-id", "rq-f", "--message-id", "pm-f", "--question", "anyone?",
+            "--timeout", "30",
+        )
+        proc = self.run_codex(*send_args, timeout=30)
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        payload = self.payload(proc)
+        self.assertEqual(payload["delivery_state"], "failed_or_unknown")
+        self.assertIn("error", payload)
+
+        replay = self.run_codex(*send_args, timeout=30)
+        self.assertEqual(replay.returncode, 7, replay.stdout + replay.stderr)
+        replay_payload = self.payload(replay)
+        self.assertTrue(replay_payload["idempotent"])
+        self.assertNotIn("error", replay_payload, "a replay must not re-dispatch")
 
     def test_ask_child_rejected_binding_does_not_touch_root(self):
         empty_root = self.new_root("askchild-missing")

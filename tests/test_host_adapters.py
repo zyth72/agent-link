@@ -112,6 +112,19 @@ class AdapterEntryCase(unittest.TestCase):
         codex_parent = codex.get_adapters().parent
         self.assertEqual(codex_parent.capabilities()["busy_behavior"], "unknown")
         self.assertEqual(codex_parent.capabilities()["wake_after_turn"], "unknown")
+        opencode_parent = opencode.get_adapters().parent
+        opencode_capabilities = opencode_parent.capabilities()
+        self.assertEqual(opencode_capabilities["notification_transport"], "opencode_prompt_http")
+        self.assertEqual(opencode_capabilities["delivery"], "queue")
+        self.assertFalse(opencode_capabilities["polling"])
+        self.assertEqual(opencode_capabilities["busy_behavior"], "unknown")
+        self.assertEqual(opencode_capabilities["wake_after_turn"], "unknown")
+        opencode_child = opencode.get_adapters().child
+        child_capabilities = opencode_child.capabilities()
+        self.assertEqual(child_capabilities["delivery_transport"], "opencode_prompt_http")
+        self.assertEqual(child_capabilities["delivery"], "queue")
+        self.assertFalse(child_capabilities["polling"])
+        self.assertEqual(child_capabilities["wake_child"], "unknown")
 
     def test_old_module_paths_are_gone(self):
         for name in (

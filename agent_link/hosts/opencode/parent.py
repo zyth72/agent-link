@@ -1,20 +1,17 @@
-"""OpenCode parent-side notification adapter.
+"""OpenCode parent notifications over the native prompt HTTP endpoint.
 
-The transport is the shared parent bridge file: ``notify()`` appends one JSONL
-event per notification to ``<root>/omp-bridge/<binding_id>.jsonl``.  The
-OpenCode session runs ``extensions/opencode/agent-link.ts`` (OpenCode v2 plugin
-API), which is the single consumer of the file and injects validated events
-into the tracked session with ``ctx.session.prompt``.
-
-Only the capability labels differ from the OMP adapter; append semantics,
-locking and failure mapping (``DeliveryFailure`` -> ``failed_or_unknown``) are
-identical because both call the neutral shared bridge helpers.
+``notify()`` reads the frozen session/serve descriptors and injects the
+rendered parent prompt into the bound OpenCode session with
+``POST /api/session/<session_id>/prompt`` (``delivery:"queue"``, prompt ``id``
+= Agent Link ``message_id``).  This replaces the former parent bridge file and
+its plugin watcher; there is no file fallback.  Missing, unmanaged, stale or
+mismatched descriptors and transport failures are explicit
+``failed_or_unknown`` outcomes.
 """
 from __future__ import annotations
 
-from ...errors import DeliveryFailure
-from ...shared import append_parent_bridge
 from ..base import ParentAdapter
+from .push import deliver
 
 
 class OpenCodeParentAdapter(ParentAdapter):
@@ -24,20 +21,16 @@ class OpenCodeParentAdapter(ParentAdapter):
         return {
             "host": "opencode",
             "driver": "agent_link.hosts.opencode.parent:OpenCodeParentAdapter",
-            "notification_transport": "session_bridge_file",
-            "notification_bridge": (
-                "<root>/omp-bridge/<binding_id>.jsonl + AGENT_LINK_BRIDGE_FILE watcher "
-                "(extensions/opencode/agent-link.ts)"
-            ),
+            "notification_transport": "opencode_prompt_http",
             "receive_mode": "session_injection",
+            "delivery": "queue",
+            # No resume field is sent; scheduling follows the framework
+            # default and busy/wake behavior is [推断], not verified.
+            "resume": "framework_default_unknown",
             "busy_behavior": "unknown",
             "wake_after_turn": "unknown",
+            "polling": False,
         }
 
     def notify(self, root, binding, message):
-        try:
-            return append_parent_bridge(root, binding, message)
-        except OSError as error:
-            raise DeliveryFailure(
-                f"cannot append OpenCode bridge event for {binding['binding_id']}: {error}"
-            ) from error
+        return deliver(root, binding, message, role="parent")

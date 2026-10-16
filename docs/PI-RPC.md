@@ -1,6 +1,6 @@
 # Pi RPC 子端控制器规范（PI-RPC v1）
 
-本文件定义 Pi 作为**子端**时的 RPC 接入：父端通过本机 loopback 控制通道把消息送进一个专用 Pi 进程，不写文件收件箱、不轮询。父端交互式会话继续由 `extensions/pi/agent-link.ts` 的桥 watcher 注入，不改 RPC。
+本文件定义 Pi 作为**子端**时的 RPC 接入：父端通过本机 loopback 控制通道把消息送进一个专用 Pi 进程，不写文件收件箱、不轮询。父端交互式会话继续由 `extensions/pi/agent-link.ts` 注册的 session HTTP 主动推送注入（见 [SESSION-PUSH](SESSION-PUSH.md)），不改 RPC。
 
 - 传输：控制器持有 `pi --mode rpc` 子进程的 stdin/stdout；父端 CLI（`ask-child`/`send-child`）或 Codex helper 通过 loopback HTTP + 独立随机 token 调用控制器。
 - 只支持同一台机器、同一可信 OS 用户；不承诺跨机、MCP 或防恶意同用户进程。
@@ -9,7 +9,7 @@
 ## 1. 组件与生命周期
 
 ```text
-父端交互会话（插件 watcher，不改）
+父端交互会话（session HTTP 推送，不改）
         │  report/ask 上行（现有 host 服务）
 父端 CLI ── HTTP ──> Pi RPC 控制器 ── stdin/stdout JSONL ──> 专用 Pi 进程（--mode rpc）
    │                                                        └─ extensions/pi/agent-link.ts
@@ -27,7 +27,7 @@
      [--rpc-timeout 30] [--stop-grace 10]
    ```
 
-   控制器启动专用 Pi：`pi --mode rpc --session-id <child.session_id> --extension <扩展> --no-extensions --no-skills --no-context-files`（轻量禁用其他 extensions/skills/context；显式 `--extension` 仍加载）。子进程环境设置 `AGENT_LINK_CREDENTIALS=<credentials>`，并移除继承的 `AGENT_LINK_BRIDGE_FILE`/`AGENT_LINK_BINDING`，避免子进程重复消费父端桥。
+   控制器启动专用 Pi：`pi --mode rpc --session-id <child.session_id> --extension <扩展> --no-extensions --no-skills --no-context-files`（轻量禁用其他 extensions/skills/context；显式 `--extension` 仍加载）。子进程环境设置 `AGENT_LINK_CREDENTIALS=<credentials>`，并防御性移除遗留的 `AGENT_LINK_BRIDGE_FILE`/`AGENT_LINK_BINDING`（桥传输已删除，不再有消费者）。
 3. `ready` 只在真实 `get_state` response 返回且 `data.sessionId == child.session_id` 后才输出；输出的 JSON 含 descriptor 路径与 endpoint，不含 token。
 4. 控制器长驻：`agent_settled` 只表示 Pi 变空闲，不是进程退出；控制器不因 agent 空闲而退出。
 5. `stop` 优雅关闭 stdin，等待进程退出；超时则对 Pi 进程组（`start_new_session`）SIGTERM，再超时 SIGKILL。控制器自身的 SIGTERM/SIGINT 走同一清理路径，不留孤儿进程。清理只删除仍属于本进程的 descriptor。
@@ -85,16 +85,16 @@
 
 ## 5. ask-child / send-child 分发
 
-核心 CLI 的父→子分发按 `child.framework` 选择子端适配器：
+核心 CLI 同时提供 `ask-child`（阻塞等待答复）与 `send-child`（非阻塞：持久化并投递后立即返回 `request_id`/`delivery_state`，不等模型；见 [HOST-PROTOCOL §6.4](HOST-PROTOCOL.md)）。两者共用同一 `prepare_parent_ask` 持久化与下述适配器分发。核心 CLI 的父→子分发按 `child.framework` 选择子端适配器：
 
 - `pi` 且 `<root>/pi-rpc/<binding>.json` 存在且可校验（协议、binding/run/child session 身份、`ready`、loopback endpoint）：用共享的 `build_child_prompt` 渲染问题，经 `/v1/prompt`（`streamingBehavior:"steer"`）送入 Pi；不写 inbox；记录 `host_accepted` 后立即进入核心等待状态机等 `answer_parent`。
 - descriptor 存在但不可用（旧协议、身份不匹配、state 非 ready、网络/认证失败）：**明确失败**为 `failed_or_unknown`，不得静默降级到 inbox。
 - descriptor 不存在：改用目标 Pi session 的 HTTP 主动推送接口（见 SESSION-PUSH.md）；接口缺失或失效明确失败，不写 inbox。
-- OMP 子端使用 session HTTP，OpenCode 保持 inbox；未实现的子端框架明确报错。
+- OMP 子端使用 session HTTP，OpenCode 使用原生 prompt HTTP 推送（描述符契约）；未实现的子端框架明确报错。
 
 Codex helper `agent_link.hosts.codex.cli` 在现有 registry/SQLite 归属校验之后提供：
 
-- `send-child`：非阻塞版父端请求（持久化 `prepare_parent_ask` 后派发，返回 `request_id`/`delivery_state`，不等模型）。
+- `send-child`：直接复用核心 `cli.cmd_send_child`（helper 内不再重复实现），非阻塞，JSON 与退出码与核心一致。
 - `child-status`：读取 descriptor 并**按需**调用 `/v1/status`；无控制器时返回 `controller: "absent"`，不伪造在线。
 - `stop-child`：经 `/v1/stop` 停止控制器；无 descriptor 明确 6。
 

@@ -47,7 +47,8 @@ python3 -m agent_link --root /abs/runtime get-request \
 | `ask ...` | 先持久化请求，再通知父端，然后阻塞等待答复 | 0 / 3 / 4 / 5 / 7 |
 | `reply ...` | 关联已存在请求写入答复；不允许覆盖 | 0 / 4 / 5 / 6 |
 | `get-request ...` | 返回请求状态与答复 | 0 / 5 / 6 |
-| `ask-child ...` | 父端请求子端答复并阻塞等待（按框架使用 Pi RPC、session HTTP 或 OpenCode inbox） | 0 / 3 / 4 / 5 / 6 / 7 |
+| `ask-child ...` | 父端请求子端答复并阻塞等待（子端适配器：Pi RPC/session HTTP、OMP session HTTP、OpenCode 原生 prompt 推送） | 0 / 3 / 4 / 5 / 6 / 7 |
+| `send-child ...` | 父端随时向子端发送请求但不等答复（非阻塞；`host_accepted` 返回 0，投递失败/未确定返回 7） | 0 / 4 / 5 / 6 / 7 |
 | `answer ...` | 子端答复父端请求；不允许覆盖 | 0 / 4 / 5 / 6 |
 | `get-parent-request ...` | 返回父端请求状态与答复 | 0 / 5 / 6 |
 | `list-parent-requests --binding ID [--pending]` | 列出父端请求 | 0 / 6 |
@@ -113,7 +114,7 @@ python3 -m agent_link --root /abs/runtime get-request \
 - `timed_out` 之后不允许再写入第二个不同的迟到答复（冲突）。
 - 请求、答复和审计事件（events 表）保留到显式人工清理，不自动删除。
 
-父端请求（`parent_requests`，父端 `ask-child` 发起、子端 `answer` 答复）语义与子端请求完全镜像：`pending -> answered | timed_out`，幂等/冲突/迟到答复（`late=true`）规则相同；父端请求的投递状态写在请求行上——子端 inbox 事件写入成功即 `host_accepted`，不代表子端已处理，是否处理由持久化的答复证明。
+父端请求（`parent_requests`，父端 `ask-child`/`send-child` 发起、子端 `answer` 答复）语义与子端请求完全镜像：`pending -> answered | timed_out`，幂等/冲突/迟到答复（`late=true`）规则相同；两者先走同一 `prepare_parent_ask` 持久化与同一子端适配器投递，`ask-child` 继续等待，`send-child` 在投递返回后立即结束。父端请求的投递状态写在请求行上——投递被接受即 `host_accepted`，不代表子端已处理，是否处理由持久化的答复证明。
 
 ## 能力声明
 
@@ -166,7 +167,7 @@ python3 -m agent_link.host --root /abs/runtime --binding live-001 \
 
 ## OpenCode 父端/子端（可选）
 
-OpenCode 用 v2 插件 `extensions/opencode/agent-link.ts`（本机验证 2.0.29；v1 插件形态会被拒绝加载）：把文件放入 `~/.config/opencode/plugin/` 后每个会话自动加载。子端五个工具与 OMP 同名同语义；watcher 复用共享模块，同样支持注册表自动认领。父端宿主服务用 `--driver agent_link.hosts.opencode.parent:OpenCodeParentAdapter`（文件桥与 OMP 相同）。已知限制（server 级多会话归属近似等）见 [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md) §7 与插件文件头注释。
+OpenCode 用 v2 插件 `extensions/opencode/agent-link.ts`（本机验证 2.0.29；v1 插件形态会被拒绝加载）：把文件放入 `~/.config/opencode/plugin/` 后每个会话自动加载。插件只注册五个子端工具（与 OMP 同名同语义），不再有文件 watcher；父→子投递由 Python 适配器直连框架原生 `POST /api/session/:id/prompt`（Basic 认证 + 会话/serve 描述符契约，见 [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md) §6.3）。集成自管 serve 与描述符写入的 runner 编排属切片 3；模型端到端（空闲唤醒/busy 投递）尚未验收。
 
 ## Codex 父端助手（agent_link.hosts.codex.cli，推荐）
 
@@ -183,15 +184,17 @@ python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BIND
 python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BINDING \
   ask-child --request-id R --message-id M --question Q --timeout 240
 python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BINDING \
+  send-child --request-id R --message-id M --question Q --timeout 240
+python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BINDING \
   get-request --request-id R
 python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BINDING \
   list-parent-requests --pending
 ```
 
-- 支持 `list`、`reply`、`ask-child`、`get-request`、`get-parent-request`、`list-parent-requests`；参数与核心 CLI 同名，复用同一 handler，JSON 与退出码不变。
+- 支持 `list`、`reply`、`ask-child`、`send-child`、`get-request`、`get-parent-request`、`list-parent-requests`；`ask-child`/`send-child` 参数与核心 CLI 同名，且 `send-child` 直接复用核心 handler，JSON 与退出码不变。
 - **不接受 `--root`**；坏条目/缺 root/缺数据库在 `list` 中作为 `rejected` 带原因返回，不自动建库，也不会把消息里的 root 当成执行目标。
 - 仅当恰好一个候选通过校验时才能省略 `--binding`；多条匹配必须显式选择。
-- `ask-child` 阻塞；长等待放进 background-tasks 后台任务。能否唤醒子端取决于子端适配器（Pi 使用 RPC 或 session HTTP；OMP 使用 session HTTP；OpenCode 保留 inbox watcher；Codex 子端未实现）。
+- `ask-child` 阻塞；长等待放进 background-tasks 后台任务。`send-child` 非阻塞（交付后立即返回 0/7），适合父端随时下发消息。能否唤醒子端取决于子端适配器（Pi 使用 RPC 或 session HTTP；OMP 使用 session HTTP；OpenCode 使用原生 prompt 推送；Codex 子端未实现）；busy 时是否可达以模型端到端验收为准。
 - wrapper：`python3 /abs/repo/skills/agent-link/scripts/link.py --codex --session-id CURRENT_THREAD list` 可从任意 cwd 调用；独立安装副本用脚本旁的 `repo-location.json` 定位仓库。
 
 完整流程、校验规则与宿主服务启动步骤见 [docs/CODEX.md](docs/CODEX.md)。
@@ -203,7 +206,7 @@ cd /path/to/agent-intercom-workspace
 python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v
 ```
 
-自动测试不调用模型或改真实 Codex 配置。核心覆盖状态、幂等、冲突、超时与迟到答复；Pi/OMP 推送覆盖本地 HTTP 认证、身份校验、上限、错误、生命周期与注入；OpenCode 文件 watcher 另有覆盖。真实模型验收单独记录在 [SESSION-PUSH](docs/SESSION-PUSH.md) 与 [PI-RPC](docs/PI-RPC.md)，不把模拟上下文当作模型行为证据。
+自动测试不调用模型或改真实 Codex 配置。核心覆盖状态、幂等、冲突、超时与迟到答复，包括 `send-child` 非阻塞/幂等/与 `ask-child` 共享状态机；Pi/OMP 推送覆盖本地 HTTP 认证、身份校验、上限、错误、生命周期与注入；OpenCode 原生 prompt 推送（fake serve）与插件五工具注册另有覆盖。真实模型验收单独记录在 [SESSION-PUSH](docs/SESSION-PUSH.md) 与 [PI-RPC](docs/PI-RPC.md)，不把模拟上下文当作模型行为证据。
 
 ## 已知限制
 

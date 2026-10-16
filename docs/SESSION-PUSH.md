@@ -30,7 +30,7 @@ Pi：空闲调用 sendUserMessage，忙碌调用 followUp，不改变用户正�
 
 ## 能力和验证
 
-Pi/OMP 父端 capabilities.notification_transport=session_push_http、polling=false；OMP 子端 delivery_transport=session_push_http。OpenCode 本轮继续使用自己的文件 watcher，不声明已去轮询。请求等待状态查询和测试等待与消息传输轮询是不同操作。
+Pi/OMP 父端 capabilities.notification_transport=session_push_http、polling=false；OMP 子端 delivery_transport=session_push_http。OpenCode 不使用本文件的 `agent-link-push/1` 监听接口：其 Python 父子适配器直连框架原生 prompt HTTP 端点（Basic 认证 + 独立的会话/serve 描述符契约，见 [HOST-PROTOCOL §6.3](HOST-PROTOCOL.md)），capabilities 已改为 push 语义，插件侧文件 watcher 已删除。请求等待状态查询和测试等待与消息传输轮询是不同操作。
 
 模拟测试覆盖认证、身份、上限、并发、失败与生命周期；真实接口测试验证本地框架加载；模型端到端记录正式扩展的真实模型行为。忙碌、中断、重连等尚无端到端证据时保持 unknown，不以原生文档代替验收。
 

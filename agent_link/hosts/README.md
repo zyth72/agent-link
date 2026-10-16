@@ -17,7 +17,7 @@ Agent Link 是跨 Agent 框架的小工具集合，提供通信工具，并管�
 | Codex Desktop | 有 | 无，`child=None` | [Codex](codex/README.md) |
 | Pi | 有 | 有，专用 RPC 控制器 | [Pi](pi/README.md) |
 | OMP | 有 | 有，session HTTP 主动推送 | [OMP](omp/README.md) |
-| OpenCode | 有 | 有，插件与文件收件箱 | [OpenCode](opencode/README.md) |
+| OpenCode | 有 | 有，原生 prompt HTTP 推送（描述符契约） | [OpenCode](opencode/README.md) |
 
 框架原生能力、适配器已实现能力、当前进程是否连接分别判断。入口 `get_adapters()` 返回对象不代表进程已经启动；操作成功也不代表模型已处理。
 

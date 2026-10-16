@@ -1,15 +1,14 @@
 """OpenCode plugin acceptance: no-model registration, real HTTP loopback
-closed loop, and the bridge watcher suite.
+closed loop, and the removed-watcher residue check.
 
 Child side: loads the real ``extensions/opencode/agent-link.ts`` (OpenCode v2
-plugin API) with Bun or Node (type stripping) and calls the tools against a
-real ``agent_link.host`` service whose OpenCodeHost driver writes the bridge
-file; the parent stand-in replies through the ordinary store API.  Watcher
-side: drives the same plugin's bridge watchers with a fake plugin context over
-real bridge files (restart resume, a failing injection, a second consumer,
-session switching, file replacement, oversized/invalid events, registry
-auto-claim).  Registration side: boots a real ``opencode serve`` in an
-isolated HOME and confirms the plugin loads and registers the five tools.
+plugin API) with Bun or Node (type stripping) and calls the five tools against
+a real ``agent_link.host`` service whose OpenCode parent adapter pushes through
+the native prompt HTTP endpoint (fake serve); the parent stand-in replies
+through the ordinary store API.  Registration side: boots a real
+``opencode serve`` in an isolated HOME and confirms the plugin loads and
+registers the five tools.  Slice 2 removed the plugin bridge watcher, so no
+bridge/lock/cursor test suite remains.
 
 Never calls a model, never touches a real OpenCode session or the user's real
 opencode configuration.  Skipped when neither Bun nor a type-stripping Node
@@ -34,8 +33,8 @@ import urllib.request
 from pathlib import Path
 
 from agent_link.errors import AgentLinkError
-from agent_link.registry import entry_from_row, write_entry
 from tests import isolate_registry
+from tests.opencode_server import MockOpenCodeServe, write_descriptor_pair
 from agent_link.storage import Store
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -119,6 +118,19 @@ class OpenCodeChildE2ECase(unittest.TestCase):
         finally:
             store.close()
         self.bridge_file = self.root / "omp-bridge" / f"{self.binding}.jsonl"
+        self.sessions = self.base / "sessions"
+        previous = os.environ.get("AGENT_LINK_SESSIONS")
+        os.environ["AGENT_LINK_SESSIONS"] = str(self.sessions)
+
+        def restore_env():
+            os.environ.pop("AGENT_LINK_SESSIONS", None)
+            if previous is not None:
+                os.environ["AGENT_LINK_SESSIONS"] = previous
+
+        self.addCleanup(restore_env)
+        self.serve = MockOpenCodeServe("e2e-parent")
+        self.addCleanup(self.serve.close)
+        write_descriptor_pair(self.sessions, self.serve)
         self.hosts: list[subprocess.Popen] = []
         self.addCleanup(self.stop_all_hosts)
 
@@ -268,372 +280,18 @@ class OpenCodeChildE2ECase(unittest.TestCase):
         self.assertEqual(parent_row["status"], "answered")
         self.assertEqual(parent_row["answer"], "child answer")
         self.assertEqual(parent_row["answer_message_id"], ids["parent_answer_message_id"])
-        events = [
-            json.loads(line)
-            for line in self.bridge_file.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        self.assertEqual(len(events), 2)
-        self.assertEqual([event["kind"] for event in events], ["report", "ask"])
-        self.assertEqual([event["source"] for event in events], ["service", "service"])
+        self.assertEqual(len(self.serve.prompts), 2)
+        self.assertEqual(
+            [prompt["id"] for prompt in self.serve.prompts],
+            [ids["report_message_id"], ids["question_message_id"]],
+        )
+        self.assertEqual([prompt["delivery"] for prompt in self.serve.prompts], ["queue", "queue"])
+        self.assertIn("[agent-link:report]", self.serve.prompts[0]["text"])
+        self.assertIn("[agent-link:ask]", self.serve.prompts[1]["text"])
+        self.assertFalse(self.bridge_file.exists(), "the push transport must not write a bridge file")
 
         self.stop_host(host)
         self.assertFalse(self.credentials.exists(), "graceful shutdown removes its own credentials")
-
-
-class OpenCodeBridgeCase(unittest.TestCase):
-    """Bridge watcher acceptance, no service and no model."""
-
-    binding = "bridge-b"
-
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        isolate_registry(self)
-        self.base = Path(self.temp.name)
-        self.bridge_file = self.base / "omp-bridge" / f"{self.binding}.jsonl"
-        self.inbox_file = self.base / "inbox" / f"{self.binding}.jsonl"
-
-    # -- helpers -------------------------------------------------------
-    def bridge_env(self, extra: dict | None = None) -> dict:
-        env = dict(os.environ)
-        env["AGENT_LINK_BRIDGE_FILE"] = str(self.bridge_file)
-        env["AGENT_LINK_BINDING"] = self.binding
-        env.pop("AGENT_LINK_CREDENTIALS", None)
-        env.update(extra or {})
-        return env
-
-    def write_events(
-        self,
-        prompts: list[str],
-        binding: str | None = None,
-        thread_id: str = "parent",
-        child_session_id: str = "child",
-        path: Path | None = None,
-    ) -> list[bytes]:
-        target = path or self.bridge_file
-        target.parent.mkdir(parents=True, exist_ok=True)
-        lines = [
-            json.dumps(
-                {
-                    "v": 1,
-                    "ts": "2026-01-01T00:00:00.000Z",
-                    "source": "service",
-                    "binding_id": self.binding if binding is None else binding,
-                    "thread_id": thread_id,
-                    "child_session_id": child_session_id,
-                    "kind": "report",
-                    "message_id": f"m-{index}",
-                    "prompt": prompt,
-                }
-            )
-            + "\n"
-            for index, prompt in enumerate(prompts, start=1)
-        ]
-        with target.open("a", encoding="utf-8") as stream:
-            stream.write("".join(lines))
-        return [line.encode("utf-8") for line in lines]
-
-    def run_bridge(self, scenario: str = "bridge", extra_env: dict | None = None, timeout: int = 120) -> dict:
-        process = subprocess.run(
-            [RUNTIME, str(TOOL_LOOP), scenario],
-            capture_output=True,
-            text=True,
-            cwd=str(REPO_ROOT),
-            env=self.bridge_env(extra_env),
-            timeout=timeout,
-        )
-        self.assertEqual(
-            process.returncode, 0, f"{scenario} failed:\n{process.stdout}\n{process.stderr}"
-        )
-        lines = [line for line in process.stdout.splitlines() if line.strip()]
-        self.assertTrue(lines, f"{scenario} printed nothing")
-        return json.loads(lines[-1])
-
-    def cursor_offset(self) -> int | None:
-        path = Path(str(self.bridge_file) + ".cursor")
-        if not path.is_file():
-            return None
-        return json.loads(path.read_text(encoding="utf-8"))["offset"]
-
-    # -- auto-claim helpers (session-id discovery) -------------------------
-    def claim_env(
-        self, session_id: str, extra: dict | None = None, bridge_file: Path | None = None
-    ) -> dict:
-        env = dict(os.environ)
-        env.pop("AGENT_LINK_BRIDGE_FILE", None)
-        env.pop("AGENT_LINK_BINDING", None)
-        env.pop("AGENT_LINK_CREDENTIALS", None)
-        env["AGENT_LINK_TEST_BRIDGE_FILE"] = str(bridge_file or self.bridge_file)
-        env["AGENT_LINK_TEST_SESSION_ID"] = session_id
-        env.update(extra or {})
-        return env
-
-    def write_claim(self, binding: str, parent_session: str, child_session: str = "child") -> None:
-        write_entry(
-            entry_from_row(
-                self.base,
-                {
-                    "binding_id": binding,
-                    "run_id": "r-" + binding,
-                    "native_task_id": None,
-                    "parent_framework": "opencode",
-                    "parent_session_id": parent_session,
-                    "child_framework": "opencode",
-                    "child_session_id": child_session,
-                    "config_digest": "d" * 64,
-                },
-            )
-        )
-
-    def run_claim(
-        self, scenario: str, session_id: str, timeout: int = 120, bridge_file: Path | None = None
-    ) -> dict:
-        process = subprocess.run(
-            [RUNTIME, str(TOOL_LOOP), scenario],
-            capture_output=True,
-            text=True,
-            cwd=str(REPO_ROOT),
-            env=self.claim_env(session_id, bridge_file=bridge_file),
-            timeout=timeout,
-        )
-        self.assertEqual(
-            process.returncode, 0, f"{scenario} failed:\n{process.stdout}\n{process.stderr}"
-        )
-        lines = [line for line in process.stdout.splitlines() if line.strip()]
-        self.assertTrue(lines, f"{scenario} printed nothing")
-        return json.loads(lines[-1])
-
-    # -- auto-claim tests -------------------------------------------------
-    @unittest.skipUnless(RUNTIME, "bun or a type-stripping node is required")
-    def test_auto_claim_matches_session_id(self):
-        session_id = "parent-auto"
-        self.write_claim("bridge-b", session_id)
-        self.write_events(["auto-1", "auto-2"], thread_id=session_id)
-        out = self.run_claim("bridge-auto-claim", session_id)
-        self.assertEqual([entry["text"] for entry in out["sent"]], ["auto-1", "auto-2"])
-        for entry in out["sent"]:
-            self.assertEqual(entry["sessionID"], session_id)
-            self.assertEqual(entry["delivery"], "queue")
-        self.assertTrue(out["lockHeld"])
-        self.assertFalse(out["lockAfterShutdown"], "shutdown must release the lock")
-        self.assertEqual(out["cursor"]["offset"], self.bridge_file.stat().st_size)
-
-    @unittest.skipUnless(RUNTIME, "bun or a type-stripping node is required")
-    def test_auto_claim_ignores_other_parents_and_foreign_thread(self):
-        session_id = "parent-auto"
-        self.write_claim("other-b", "someone-else")
-        self.write_claim("bridge-b", session_id)
-        self.write_events(["auto-wrong"], thread_id="not-me")
-        self.write_events(["auto-ok"], thread_id=session_id)
-        out = self.run_claim("bridge-auto-claim", session_id)
-        self.assertEqual([entry["text"] for entry in out["sent"]], ["auto-ok"])
-        self.assertTrue(
-            any("skipping invalid event" in line for line in out["logs"]),
-            out["logs"],
-        )
-
-    @unittest.skipUnless(RUNTIME, "bun or a type-stripping node is required")
-    def test_auto_claim_discovers_late_binding(self):
-        session_id = "parent-auto"
-        process = subprocess.Popen(
-            [RUNTIME, str(TOOL_LOOP), "bridge-auto-claim-late"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=str(REPO_ROOT),
-            env=self.claim_env(session_id),
-        )
-        try:
-            time.sleep(2.5)  # the plugin is up while the registry is still empty
-            self.write_claim("bridge-b", session_id)
-            self.write_events(["late-1"], thread_id=session_id)
-            stdout, stderr = process.communicate(timeout=90)
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=10)
-        self.assertEqual(process.returncode, 0, stderr)
-        lines = [line for line in stdout.splitlines() if line.strip()]
-        self.assertTrue(lines)
-        out = json.loads(lines[-1])
-        self.assertEqual([entry["text"] for entry in out["sent"]], ["late-1"])
-        self.assertTrue(out["lockHeld"])
-
-    @unittest.skipUnless(RUNTIME, "bun or a type-stripping node is required")
-    def test_auto_claim_child_inbox(self):
-        """A child session claims its inbox by child.session_id and gets woken."""
-        session_id = "child-auto"
-        self.write_claim("bridge-b", parent_session="parent-1", child_session=session_id)
-        self.write_events(
-            ["inbox-1", "inbox-2"],
-            thread_id="parent-1",
-            child_session_id=session_id,
-            path=self.inbox_file,
-        )
-        self.write_events(
-            ["inbox-wrong"],
-            thread_id="parent-1",
-            child_session_id="other-child",
-            path=self.inbox_file,
-        )
-        out = self.run_claim("bridge-auto-claim", session_id, bridge_file=self.inbox_file)
-        self.assertEqual([entry["text"] for entry in out["sent"]], ["inbox-1", "inbox-2"])
-        self.assertTrue(
-            any("skipping invalid event" in line for line in out["logs"]),
-            out["logs"],
-        )
-        self.assertTrue(out["lockHeld"])
-        self.assertFalse(out["lockAfterShutdown"])
-
-    @unittest.skipUnless(RUNTIME, "bun or a type-stripping node is required")
-    def test_failed_injection_retries_in_same_process(self):
-        """Regression: the failed line must be restored byte-exact (with its newline)."""
-        self.write_events(["event-A", "event-B", "event-C"])
-        marker = self.base / "fail.marker"
-        marker.write_text("event-B", encoding="utf-8")
-        out = self.run_bridge(
-            "bridge-fail-retry-same-process", extra_env={"AGENT_LINK_TEST_FAIL_FILE": str(marker)}
-        )
-        self.assertEqual(
-            [entry["text"] for entry in out["sent"]],
-            ["event-A", "event-B", "event-C"],
-            "a same-process retry must restore the exact line and preserve order",
-        )
-        self.assertEqual(out["cursor"]["offset"], self.bridge_file.stat().st_size)
-
-    # -- tests ---------------------------------------------------------
-    @unittest.skipUnless(RUNTIME, "bun or a type-stripping node is required")
-    def test_resume_across_restarts(self):
-        self.write_events(["prompt-A", "prompt-B"])
-        size = self.bridge_file.stat().st_size
-        first = self.run_bridge()
-        self.assertEqual([entry["text"] for entry in first["sent"]], ["prompt-A", "prompt-B"])
-        for entry in first["sent"]:
-            self.assertEqual(entry["sessionID"], "parent")
-            self.assertEqual(entry["delivery"], "queue")
-        self.assertEqual(first["cursor"]["offset"], size)
-        stat = self.bridge_file.stat()
-        self.assertEqual((first["cursor"]["dev"], first["cursor"]["ino"]), (stat.st_dev, stat.st_ino))
-        self.assertFalse(first["lockExists"], "shutdown must release the lock")
-        second = self.run_bridge()
-        self.assertEqual(second["sent"], [], "a restart must not replay consumed events")
-        self.assertEqual(second["cursor"]["offset"], size)
-
-    @unittest.skipUnless(RUNTIME, "bun or a type-stripping node is required")
-    def test_failure_blocks_and_preserves_order(self):
-        byte_lines = self.write_events(["event-A", "event-B", "event-C"])
-        marker = self.base / "fail.marker"
-        marker.write_text("event-B", encoding="utf-8")
-        first = self.run_bridge(extra_env={"AGENT_LINK_TEST_FAIL_FILE": str(marker)})
-        self.assertEqual([entry["text"] for entry in first["sent"]], ["event-A"])
-        self.assertIn("injection failed", "\n".join(first["logs"]))
-        self.assertFalse(marker.exists(), "the failing injection consumes its marker")
-        self.assertEqual(first["cursor"]["offset"], len(byte_lines[0]), "cursor stops before the failure")
-        second = self.run_bridge()
-        self.assertEqual(
-            [entry["text"] for entry in second["sent"]],
-            ["event-B", "event-C"],
-            "the retry resumes at the failed event, not before it",
-        )
-        self.assertEqual(second["cursor"]["offset"], self.bridge_file.stat().st_size)
-
-    @unittest.skipUnless(RUNTIME, "bun or a type-stripping node is required")
-    def test_second_consumer_is_refused_then_reclaimed(self):
-        self.write_events(["event-1"])
-        holder = subprocess.Popen(
-            [RUNTIME, str(TOOL_LOOP), "bridge-hold"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=str(REPO_ROOT),
-            env=self.bridge_env(),
-        )
-        try:
-            holding_line = holder.stdout.readline()
-            self.assertTrue(holding_line, "bridge-hold never reported holding")
-            self.assertTrue(json.loads(holding_line)["holding"])
-            # The holder consumes event-1 on its first tick; wait for its cursor.
-            deadline = time.time() + 15
-            while time.time() < deadline and self.cursor_offset() is None:
-                time.sleep(0.05)
-            taken_offset = self.cursor_offset()
-            self.assertIsNotNone(taken_offset, "the holder never consumed the first event")
-            refused = self.run_bridge()
-            self.assertTrue(refused["refused"], refused)
-            self.assertEqual(refused["sent"], [])
-            self.assertEqual(self.cursor_offset(), taken_offset, "a refused consumer writes no cursor")
-            holder_token = json.loads(holding_line)["lock"]
-            lock_text = Path(str(self.bridge_file) + ".lock").read_text(encoding="utf-8").strip()
-            self.assertEqual(
-                lock_text, holder_token, "a refused consumer leaves the owner's lock alone"
-            )
-        finally:
-            holder.kill()
-            holder.wait(timeout=15)
-            holder.stdout.close()
-            holder.stderr.close()
-        # The stale lock of the dead holder is reclaimed and new events flow.
-        self.write_events(["event-2"])
-        reclaimed = self.run_bridge()
-        self.assertFalse(reclaimed["refused"], reclaimed)
-        self.assertEqual([entry["text"] for entry in reclaimed["sent"]], ["event-2"])
-        self.assertEqual(reclaimed["cursor"]["offset"], self.bridge_file.stat().st_size)
-
-    @unittest.skipUnless(RUNTIME, "bun or a type-stripping node is required")
-    def test_session_switch_reclaims_the_lock_once(self):
-        self.write_events(["switch-event"])
-        out = self.run_bridge(scenario="bridge-switch")
-        self.assertEqual([entry["text"] for entry in out["sent"]], ["switch-event"])
-        self.assertEqual(out["injectedBeforeSwitch"], 1)
-        self.assertGreaterEqual(out["clearedTimers"], 1, "the old watcher timer must be cleared")
-        self.assertEqual(out["activeTimers"], 1, "the new session owns exactly one timer")
-        first_token, second_token = out["lockTokens"]
-        self.assertNotEqual(first_token, second_token)
-        self.assertTrue(first_token.split(":")[0].isdigit())
-        self.assertTrue(second_token.split(":")[0].isdigit())
-        self.assertFalse(out["lockExists"], "shutdown releases the lock")
-
-    @unittest.skipUnless(RUNTIME, "bun or a type-stripping node is required")
-    def test_replace_and_truncate_restart_from_zero(self):
-        self.write_events(["event-A"])
-        first = self.run_bridge()
-        self.assertEqual([entry["text"] for entry in first["sent"]], ["event-A"])
-        # Replacement at the same path (new inode): replay from the beginning.
-        self.bridge_file.unlink()
-        self.write_events(["event-B"])
-        replaced = self.run_bridge()
-        self.assertEqual([entry["text"] for entry in replaced["sent"]], ["event-B"])
-        # Truncation of the same file below the cursor: replay from zero.
-        short = json.dumps(
-            {"v": 1, "binding_id": self.binding, "prompt": "truncated-event", "kind": "report"}
-        ) + "\n"
-        self.assertTrue(len(short.encode("utf-8")) < replaced["cursor"]["offset"])
-        self.bridge_file.write_text(short, encoding="utf-8")
-        truncated = self.run_bridge()
-        self.assertEqual([entry["text"] for entry in truncated["sent"]], ["truncated-event"])
-        self.assertEqual(truncated["cursor"]["offset"], self.bridge_file.stat().st_size)
-
-    @unittest.skipUnless(RUNTIME, "bun or a type-stripping node is required")
-    def test_oversized_and_invalid_events_are_skipped(self):
-        oversized = json.dumps(
-            {"v": 1, "binding_id": self.binding, "prompt": "x" * (1024 * 1024 + 4096)}
-        )
-        lines = [
-            oversized,
-            json.dumps({"v": 1, "binding_id": self.binding}),  # missing prompt
-            json.dumps({"v": 1, "binding_id": "other-binding", "prompt": "mismatch"}),
-            json.dumps({"v": 1, "binding_id": self.binding, "prompt": "good-event"}),
-        ]
-        self.bridge_file.parent.mkdir(parents=True, exist_ok=True)
-        self.bridge_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        out = self.run_bridge()
-        self.assertEqual([entry["text"] for entry in out["sent"]], ["good-event"])
-        skips = [line for line in out["logs"] if "skip" in line]
-        self.assertEqual(len(skips), 3, out["logs"])
-        self.assertEqual(out["cursor"]["offset"], self.bridge_file.stat().st_size)
-        again = self.run_bridge()
-        self.assertEqual(again["sent"], [], "skipped events must not be retried")
 
 
 class OpenCodeRegistrationCase(unittest.TestCase):

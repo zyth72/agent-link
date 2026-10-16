@@ -21,8 +21,9 @@ agent_link/hosts/
     child.py       # session HTTP 子端推送适配
   opencode/
     __init__.py    # get_adapters
+    push.py        # 原生 prompt HTTP 推送客户端（描述符契约）
     parent.py
-    child.py       # 已有 inbox 子端适配
+    child.py       # 原生 prompt HTTP 子端推送适配
 ```
 
 TypeScript 扩展继续在 `extensions/<framework>/`，它们是加载到真实框架进程中的接入代码；Python 目录是核心可调用的宿主侧适配。不要为凑目录复制 TS 扩展或共享实现。
@@ -34,7 +35,7 @@ TypeScript 扩展继续在 `extensions/<framework>/`，它们是加载到真实�
 ## 角色与传输
 
 - 父端：用户的交互式开发会话。适配器通过插件、扩展或宿主接口投递通知；不要求父端进入 RPC 模式。
-- 子端：本次任务的专用会话。Pi 用 RPC 控制器直接写 stdin、阻塞读取 stdout 事件，不依赖定时扫描 inbox；OMP 使用 session HTTP 推送，OpenCode 保留已有文件 watcher；未来按能力替换传输。
+- 子端：本次任务的专用会话。Pi 用 RPC 控制器直接写 stdin、阻塞读取 stdout 事件，不依赖定时扫描 inbox；OMP 使用 session HTTP 推送；OpenCode 使用原生 prompt HTTP 推送（会话/serve 描述符契约）；未来按能力替换传输。
 - 通信服务和 SQLite 请求状态属于核心，不移入某个框架目录；后台运行器仍独立管理运行与取消。
 - `host_accepted` 仅表示传输接受，不等于模型已处理。`reply/answer` 与请求状态仍沿用核心规范。
 
