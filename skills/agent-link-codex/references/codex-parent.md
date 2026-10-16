@@ -13,7 +13,7 @@
 | `get-parent-request` | `--request-id` | 0 / 5 / 6 |
 | `list-parent-requests` | `[--pending]` | 0 / 5 / 6 |
 
-`--session-id` 和 `--binding` 是全局参数，也可写在各子命令后。会话 id 缺省读 `CODEX_THREAD_ID` / `CODEX_SESSION_ID`；都取不到 exit 5。
+`--session-id` 是全局参数；`--binding` 也是全局参数，也可写在各子命令后。会话 id 缺省读 `CODEX_THREAD_ID` / `CODEX_SESSION_ID`；都取不到 exit 5。
 
 ## 发现与校验（list）
 
@@ -23,14 +23,14 @@
 2. 数据库 `bindings` 行必须存在；`parent_framework/parent_session_id` 与注册表和本会话一致；`run_id`、`native_task_id`、`config_digest`、`child.framework/session_id` 与注册表一致。
 3. 用 `config_json` 重算 SHA-256，必须等于 `config_digest`。
 
-输出 `{"session_id", "registry", "registry_present", "bindings": [{...,"status":"accepted"|"rejected","reason"?}], "accepted": [...], "rejected":[{"binding_id","root","reason"}]}`，exit 0。无法解析的注册表文件也作为 rejected 报告（binding_id 用文件名）。
+输出 `{"session_id", "parent_framework", "registry", "registry_present", "bindings": [{...,"status":"accepted"|"rejected","reason"?}], "accepted": [...], "rejected":[{"binding_id","root","reason"}]}`，exit 0。无法解析的注册表文件也作为 rejected 报告（binding_id 用文件名）。
 
 ## 选择与执行
 
 - 恰好一个候选且 accepted：可省略 `--binding`。
 - 多条候选（含「一条 accepted + 其他 rejected」）：exit 5，message 提示 `--binding`，JSON 带 `bindings` 明细。
 - 唯一候选 rejected：exit 5，原因在 `bindings[0].reason`（含身份、摘要、child 或 DB 不一致的具体字段）。
-- `--binding` 未注册于本会话：exit 6；未在本会话候选里：exit 6。
+- `--binding` 未出现在本会话候选中：exit 6；出现在候选中但被 rejected：exit 5，原因在 `bindings` 明细。
 - 选定后创建 Store，并用写连接再校验 parent/child/run_id/config_digest；不一致拒绝执行。之后才调用核心 handler，输出与退出码同核心 CLI。
 
 ## 错误 JSON
@@ -41,7 +41,7 @@
 
 `ask-child` 阻塞到 `answered` 或 `timed_out`（exit 3）。长等待必须用 `run_cli` 后台执行，不要在父轮次同步等待。`timed_out` 后首个答复保存为 `late=true`、状态保持 `timed_out`；不会自动恢复已退出的等待进程。
 
-能否唤醒子端取决于子端适配器（见 [child-frameworks.md](child-frameworks.md)）：OMP/OpenCode 有 inbox watcher；Pi 子端需自己用 CLI `answer`；Codex 子端没有适配器。写入 inbox 成功只表示事件可读，答复以数据库记录为准。
+能否唤醒子端取决于子端适配器（见共享壳 [../../agent-link/references/child-frameworks.md](../../agent-link/references/child-frameworks.md)）：Pi 使用 RPC 或 session HTTP；OMP 使用 session HTTP；OpenCode 使用原生 prompt HTTP 推送（描述符契约）；Codex 子端未实现。传输成功只代表接收方接受，不代表子端已处理；是否答复以持久化的 answer 为准。
 
 ## 宿主服务与 Pi 子端
 

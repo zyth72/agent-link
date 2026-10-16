@@ -53,6 +53,10 @@ export { default } from "/abs/path/to/agent-link/extensions/pi/agent-link.ts";
 
 命令、限制与协议细节见 [USAGE.md](USAGE.md) 与 [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md)。
 
+### 父端 skill 安装
+
+`skills/agent-link/` 是共享壳（通用规则与 `scripts/link.py`），父端流程按宿主分册：`skills/agent-link-codex/`（Codex 桌面）、`skills/agent-link-omp/`（OMP）。安装时共享壳与当前宿主的分册都要对父端可见；独立安装副本由安装方在 `link.py` 旁写入 `repo-location.json`（本机产物，不入库）。OMP 用户级技能目录为 `~/.agents/skills/`（可用软链接指向仓库内分册）；Codex 按既有同步方式复制 skill 目录。
+
 ## 项目结构
 
 ```text
@@ -75,7 +79,9 @@ extensions/
 tests/               # unittest 测试（模拟 notifier/driver，不发真实桌面消息）
   pi/                # Node/jiti 扩展测试与真实 HTTP 闭环驱动脚本
   omp/               # Bun 扩展测试 harness 与桥验收驱动脚本
-skills/agent-link/   # 宿主 skill 定义 + 可从任意 cwd 调用 CLI 的 link.py
+skills/agent-link/        # 共享壳 skill（通用规则）+ 可从任意 cwd 调用 CLI 的 link.py
+skills/agent-link-codex/  # Codex 桌面父端分册 skill
+skills/agent-link-omp/    # OMP 父端分册 skill
 docs/
   HOST-PROTOCOL.md   # 宿主服务 HTTP 协议、HostDriver 扩展方式、Pi/OMP --extension 用法
   CODEX.md           # Codex 父端 helper：注册表发现、只读校验、宿主服务启动顺序
