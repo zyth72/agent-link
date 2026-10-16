@@ -23,8 +23,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agent_link.errors import DeliveryFailure
+from agent_link.errors import DeliveryFailure, ValidationError
 from agent_link.hosts.opencode import push
+from agent_link.hosts.opencode import serve as runner
 from agent_link.hosts.opencode.child import OpenCodeChildAdapter
 from agent_link.hosts.opencode.parent import OpenCodeParentAdapter
 from agent_link.storage import Store
@@ -137,6 +138,198 @@ class OpenCodePushCase(unittest.TestCase):
     def assert_no_file_fallback(self):
         self.assertFalse((self.root / "omp-bridge").exists(), "no bridge file fallback")
         self.assertFalse((self.root / "inbox").exists(), "no inbox file fallback")
+
+    # -- delivery parameterization ------------------------------------------
+    def test_steer_delivery_parameterizes_the_prompt_body(self):
+        server = self.serve("parent-1")
+        self.write_pair(server)
+        detail = push.post_prompt(
+            "opencode",
+            "parent-1",
+            "change of plan",
+            message_id="m-st",
+            delivery="steer",
+        )
+        self.assertEqual(detail, "push:opencode/parent-1#m-st")
+        self.assertEqual(len(server.requests), 1)
+        prompt = server.prompts[0]
+        self.assertEqual(set(prompt), {"id", "text", "delivery"}, "no resume field is sent")
+        self.assertEqual(prompt["id"], "msg_m-st")
+        self.assertEqual(prompt["delivery"], "steer")
+        self.assertEqual(prompt["text"], "change of plan")
+        self.assertEqual(server.admissions["msg_m-st"]["delivery"], "steer")
+
+    def test_invalid_delivery_is_rejected_before_contact(self):
+        server = self.serve("parent-1")
+        self.write_pair(server)
+        with self.assertRaises(ValidationError):
+            push.post_prompt(
+                "opencode", "parent-1", "text", message_id="m-bad", delivery="urgent"
+            )
+        self.assertEqual(server.requests, [], "an invalid delivery must never be sent")
+
+    def test_delivery_echo_mismatch_is_not_accepted(self):
+        server = self.serve(
+            "parent-1",
+            respond_status=200,
+            respond_body={
+                "data": {
+                    "id": "msg_m-st",
+                    "sessionID": "parent-1",
+                    "type": "user",
+                    "delivery": "queue",
+                }
+            },
+        )
+        self.write_pair(server)
+        with self.assertRaises(DeliveryFailure) as caught:
+            push.post_prompt(
+                "opencode", "parent-1", "text", message_id="m-st", delivery="steer"
+            )
+        self.assertIn("different delivery mode", str(caught.exception))
+
+    # -- interrupt ------------------------------------------------------------
+    def test_interrupt_happy_path_reports_upstream_flag(self):
+        server = self.serve("child-1", interrupt_result=True)
+        self.write_pair(server)
+        self.assertTrue(push.post_interrupt("opencode", "child-1"))
+        expected = "Basic " + base64.b64encode(
+            b"opencode:" + DEFAULT_PASSWORD.encode("utf-8")
+        ).decode("ascii")
+        self.assertEqual(len(server.interrupts), 1)
+        self.assertEqual(server.requests[0]["path"], "/api/session/child-1/interrupt")
+        self.assertEqual(server.requests[0]["authorization"], expected)
+        self.assertEqual(server.requests[0]["body"], b"", "the native route takes no body")
+
+        idle = self.serve("parent-1", interrupt_result=False)
+        self.write_pair(idle)
+        self.assertFalse(push.post_interrupt("opencode", "parent-1"))
+
+    def test_interrupt_invalid_identifiers_are_rejected(self):
+        with self.assertRaises(ValidationError):
+            push.post_interrupt("opencode", "../escape")
+        with self.assertRaises(ValidationError):
+            push.post_interrupt("../escape", "child-1")
+
+    def test_interrupt_missing_descriptors_fail_without_contact(self):
+        server = self.serve("child-1")
+        with self.assertRaises(DeliveryFailure) as caught:
+            push.post_interrupt("opencode", "child-1")
+        self.assertIn("no file fallback", str(caught.exception))
+        write_session_descriptor(self.sessions, server.session_descriptor())
+        with self.assertRaises(DeliveryFailure):
+            push.post_interrupt("opencode", "child-1")
+        self.assertEqual(server.requests, [], "a missing serve descriptor must not be contacted")
+        self.assert_no_file_fallback()
+
+    def test_interrupt_401_404_and_error_mapping(self):
+        wrong_password = self.serve("child-1", password="x" * 32)
+        self.write_pair(wrong_password, server={"password": "y" * 32})
+        with self.assertRaises(DeliveryFailure) as caught:
+            push.post_interrupt("opencode", "child-1")
+        message = str(caught.exception)
+        self.assertIn("401", message)
+        self.assertIn("configuration error", message)
+        self.assertNotIn("y" * 32, message)
+        self.assertNotIn("x" * 32, message)
+
+        other_session = self.serve("other-session")
+        self.write_pair(other_session, session={"session_id": "child-1"})
+        with self.assertRaises(DeliveryFailure) as caught:
+            push.post_interrupt("opencode", "child-1")
+        self.assertIn("404", str(caught.exception))
+        self.assertIn("failed_or_unknown", str(caught.exception))
+
+        broken = self.serve("child-1", respond_status=500, respond_body={"error": "boom"})
+        self.write_pair(broken)
+        with self.assertRaises(DeliveryFailure) as caught:
+            push.post_interrupt("opencode", "child-1")
+        self.assertIn("500", str(caught.exception))
+        self.assertIn("failed_or_unknown", str(caught.exception))
+
+    def test_interrupt_timeout_and_unavailable_map_to_unknown(self):
+        slow = self.serve("child-1", delay_seconds=2.0)
+        self.write_pair(slow)
+        with mock.patch.object(push, "TIMEOUT_SECONDS", 0.2):
+            with self.assertRaises(DeliveryFailure) as caught:
+                push.post_interrupt("opencode", "child-1")
+        self.assertIn("timed out or is unavailable", str(caught.exception))
+        self.assertIn("outcome unknown", str(caught.exception))
+
+        malformed = self.serve(
+            "child-1",
+            respond_status=200,
+            respond_body={"data": {"interrupted": "yes"}},
+        )
+        self.write_pair(malformed)
+        with self.assertRaises(DeliveryFailure) as caught:
+            push.post_interrupt("opencode", "child-1")
+        self.assertIn("boolean interrupted", str(caught.exception))
+
+    def test_interrupt_redirect_is_not_followed(self):
+        target = self.serve("child-1")
+        redirector = self.serve("child-1", redirect_to=target.endpoint + "/evil")
+        self.write_pair(redirector)
+        with self.assertRaises(DeliveryFailure) as caught:
+            push.post_interrupt("opencode", "child-1")
+        self.assertIn("302", str(caught.exception))
+        self.assertEqual(target.requests, [], "the redirect target must not be contacted")
+
+    def test_interrupt_password_never_in_errors(self):
+        password = "secret" * 8
+        server = self.serve("child-1", password="server" * 8)
+        self.write_pair(server, server={"password": password})
+        with self.assertRaises(DeliveryFailure) as caught:
+            push.post_interrupt("opencode", "child-1")
+        self.assertNotIn(password, str(caught.exception))
+        self.assertNotIn(password, repr(caught.exception))
+
+    # -- runner client commands ---------------------------------------------
+    def test_runner_send_delivery_and_interrupt_cli(self):
+        import io
+        import contextlib
+
+        server = self.serve("child-1", interrupt_result=True)
+        self.write_pair(server)
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = runner.main(
+                ["--root", str(self.root), "--binding", "b", "send",
+                 "--text", "steer this", "--delivery", "steer",
+                 "--message-id", "m-cli-st"]
+            )
+        self.assertEqual(code, 0)
+        result = json.loads(buffer.getvalue())
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["delivery"], "steer")
+        self.assertEqual(result["session_id"], "child-1")
+        self.assertEqual(server.prompts[-1]["delivery"], "steer")
+        self.assertEqual(server.prompts[-1]["id"], "msg_m-cli-st")
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = runner.main(
+                ["--root", str(self.root), "--binding", "b", "interrupt"]
+            )
+        self.assertEqual(code, 0)
+        result = json.loads(buffer.getvalue())
+        self.assertIs(result["interrupted"], True)
+        self.assertEqual(result["session_id"], "child-1")
+        self.assertEqual(result["detail"], "interrupt:opencode/child-1")
+        self.assertEqual(len(server.interrupts), 1)
+
+    def test_runner_interrupt_without_descriptors_is_not_found(self):
+        import io
+        import contextlib
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = runner.main(
+                ["--root", str(self.root), "--binding", "b", "interrupt"]
+            )
+        self.assertEqual(code, 6)
+        self.assertEqual(json.loads(buffer.getvalue())["error"], "not_found")
 
     # -- happy path ---------------------------------------------------------
     def test_parent_dispatch_posts_queue_prompt_over_basic_auth(self):

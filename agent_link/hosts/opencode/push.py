@@ -25,6 +25,18 @@ that mark are rejected.  Every delivery re-reads both descriptors: password
 rotation, a replaced serve or a dead pid is observed immediately and nothing
 is cached across runs.  No audit detail, log line or exception text ever
 contains the password or the Authorization header (C3).
+
+Two orchestration controls share the same descriptor contract:
+
+- ``delivery`` parameterizes the prompt body between the upstream values
+  ``"queue"`` (processed after the current turn; the default for Agent Link
+  message dispatch) and ``"steer"`` (injected into the active run).  Whether
+  a busy session actually applies a steer is a model/framework behaviour and
+  stays outside ``host_accepted``.
+- :func:`post_interrupt` calls the native ``POST /api/session/<id>/interrupt``
+  route.  ``interrupted: false`` means this serve owned no active execution
+  (for example an idle session); it is an explicit upstream answer, not an
+  error.
 """
 from __future__ import annotations
 
@@ -47,7 +59,13 @@ from ..push import session_dir
 PROTOCOL = "agent-link-opencode-push/1"
 #: Fixed route; only a descriptor-validated session id is interpolated.
 PROMPT_ROUTE = "/api/session/{session_id}/prompt"
-#: Upstream delivery mode (OpenCode queue semantics; steer is the framework default).
+#: Fixed interrupt route (native session control).
+INTERRUPT_ROUTE = "/api/session/{session_id}/interrupt"
+#: Upstream delivery modes (``Session.Inbox.Delivery``): ``queue`` waits for
+#: the current turn to finish, ``steer`` is injected into the active run.
+DELIVERY_MODES = ("queue", "steer")
+#: Upstream delivery mode used for Agent Link message dispatch (steer is the
+#: framework default for interactive clients).
 DELIVERY = "queue"
 #: Request/response body cap, matching the session push transport.
 MAX_BODY_BYTES = 65536
@@ -315,19 +333,26 @@ def post_prompt(
     message_id: str,
     timeout: float | None = None,
     resume: bool | None = None,
+    delivery: str = DELIVERY,
 ) -> str:
     """POST raw prompt text through the frozen descriptors.
 
     Shared by the host adapters (which render a prompt first) and the runner
     ``send`` command.  ``resume`` is normally left ``None`` so the framework
     default applies (the adapters never send it); passing it explicitly is
-    for orchestration and no-model real-interface tests.  Returns the audit
-    detail string; raises :class:`DeliveryFailure` with the same mapping as
-    :func:`deliver`.
+    for orchestration and no-model real-interface tests.  ``delivery``
+    parameterizes the upstream mode (``DELIVERY_MODES``); Agent Link message
+    dispatch keeps ``"queue"`` while the runner exposes steer as an explicit
+    control.  Returns the audit detail string; raises
+    :class:`DeliveryFailure` with the same mapping as :func:`deliver`.
     """
     validate_identifier(framework, "framework")
     validate_identifier(session_id, "session_id")
     validate_identifier(message_id, "message_id")
+    if delivery not in DELIVERY_MODES:
+        raise ValidationError(
+            f"opencode delivery must be one of {DELIVERY_MODES}, got {delivery!r}"
+        )
     if not isinstance(prompt, str) or not prompt.strip():
         raise DeliveryFailure("opencode prompt must be a non-empty string")
     endpoint, password = _load_credentials(framework, session_id)
@@ -339,6 +364,7 @@ def post_prompt(
         message_id,
         TIMEOUT_SECONDS if timeout is None else timeout,
         resume=resume,
+        delivery=delivery,
     )
 
 
@@ -351,9 +377,10 @@ def _post_prompt(
     timeout: float,
     *,
     resume: bool | None = None,
+    delivery: str = DELIVERY,
 ) -> str:
     prompt_id = f"msg_{message_id}"
-    body_payload = {"id": prompt_id, "text": prompt, "delivery": DELIVERY}
+    body_payload = {"id": prompt_id, "text": prompt, "delivery": delivery}
     if resume is not None:
         body_payload["resume"] = resume
     body = json.dumps(body_payload, ensure_ascii=False).encode("utf-8")
@@ -424,7 +451,106 @@ def _post_prompt(
         )
     if "id" in result and result.get("id") != prompt_id:
         raise DeliveryFailure("opencode push acknowledged a different prompt id")
+    if "delivery" in result and result.get("delivery") != delivery:
+        raise DeliveryFailure(
+            "opencode push acknowledged a different delivery mode; "
+            "not recorded as host_accepted"
+        )
     return f"push:opencode/{session_id}#{message_id}"
+
+
+def post_interrupt(
+    framework: str,
+    session_id: str,
+    *,
+    timeout: float | None = None,
+) -> bool:
+    """POST the native interrupt route through the frozen descriptors.
+
+    Returns the upstream ``interrupted`` flag: ``True`` means an active
+    execution owned by this serve was interrupted, ``False`` means there was
+    none (for example an idle session).  Both are explicit upstream answers
+    and are not delivery failures.  Raises :class:`DeliveryFailure` with the
+    same mapping as :func:`post_prompt` (401 configuration error, 404 target
+    session not found, anything else ``failed_or_unknown``).
+    """
+    validate_identifier(framework, "framework")
+    validate_identifier(session_id, "session_id")
+    endpoint, password = _load_credentials(framework, session_id)
+    return _post_interrupt(
+        endpoint,
+        session_id,
+        password,
+        TIMEOUT_SECONDS if timeout is None else timeout,
+    )
+
+
+def _post_interrupt(
+    endpoint: str,
+    session_id: str,
+    password: str,
+    timeout: float,
+) -> bool:
+    authorization = "Basic " + base64.b64encode(
+        b"opencode:" + password.encode("utf-8")
+    ).decode("ascii")
+    request = urllib.request.Request(
+        endpoint + INTERRUPT_ROUTE.format(session_id=session_id),
+        headers={"Authorization": authorization},
+        method="POST",
+    )
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    # No proxy environment, no redirect following: only the descriptor origin.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            status = response.status
+            data = response.read(MAX_BODY_BYTES + 1)
+    except urllib.error.HTTPError as error:
+        code = error.code
+        error.close()
+        if code == 401:
+            raise DeliveryFailure(
+                "opencode interrupt rejected credentials (HTTP 401): configuration error; "
+                "no retry; check the serve descriptor password"
+            ) from None
+        if code == 404:
+            raise DeliveryFailure(
+                "opencode interrupt target session not found (HTTP 404): "
+                "failed_or_unknown; no automatic resend"
+            ) from None
+        raise DeliveryFailure(
+            f"opencode interrupt failed (HTTP {code}): failed_or_unknown; no automatic resend"
+        ) from None
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        # Deliberately do not echo str(error): request headers are never logged.
+        raise DeliveryFailure(
+            f"opencode interrupt timed out or is unavailable ({type(error).__name__}); "
+            "outcome unknown, no file fallback"
+        ) from error
+
+    if not 200 <= status < 300:
+        raise DeliveryFailure(f"opencode interrupt returned unexpected status {status}")
+    if len(data) > MAX_BODY_BYTES:
+        raise DeliveryFailure("opencode interrupt response too large")
+    try:
+        result = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise DeliveryFailure(
+            "opencode interrupt response is not valid JSON; failed_or_unknown"
+        ) from None
+    if isinstance(result, dict) and isinstance(result.get("data"), dict):
+        result = result["data"]
+    if not isinstance(result, dict) or not isinstance(result.get("interrupted"), bool):
+        raise DeliveryFailure(
+            "opencode interrupt response has no boolean interrupted flag; "
+            "failed_or_unknown"
+        )
+    return result["interrupted"]
 
 
 def deliver(root, binding, message, *, role: str) -> str:

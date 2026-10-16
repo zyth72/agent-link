@@ -47,7 +47,7 @@ TypeScript 扩展继续在 `extensions/<framework>/`，它们是加载到真实�
 
 Codex 父端 CLI 放在 `agent_link.hosts.codex.cli`；Pi RPC CLI 放在 `agent_link.hosts.pi.rpc`。旧 `agent_link.hosts.codex.cli`、`agent_link.adapter`、`hosts/omp_notifier.py` 不留转发。共享渲染器和文件桥移到中立 shared 模块，其他框架不得依赖Codex/OMP目录实现共享基础功能。TypeScript扩展如需相应整理，只保留一个权威实现，不复制旧入口。
 
-Codex 子端未实现时 `child=None`。生命周期能力（start/stop/status/steer）不是所有 ChildAdapter 的强制方法，Pi RPC 控制器通过单独能力接口提供。入口对象存在不等于进程已连接，需单独检查runtime状态。
+Codex 子端未实现时 `child=None`。生命周期能力（start/stop/status/steer）不是所有 ChildAdapter 的强制方法，Pi RPC 控制器通过单独能力接口提供；OpenCode 的 steer/interrupt 由自管 serve runner 子命令（`send --delivery`、`interrupt`）提供，不进入 ChildAdapter 接口。入口对象存在不等于进程已连接，需单独检查runtime状态。
 
 ## 验证
 

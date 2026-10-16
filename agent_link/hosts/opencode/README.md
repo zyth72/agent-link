@@ -25,9 +25,9 @@
 
 | 操作 | OpenCode v2 原生 | 当前 Agent Link 适配 |
 | --- | --- | --- |
-| steer | prompt 的 `delivery:steer`，默认安全边界投递 | 未提供直接控制入口 |
+| steer | prompt 的 `delivery:steer`，默认安全边界投递 | runner `send --delivery steer` 与 `push.post_prompt(delivery=...)`；Agent Link 消息分发仍固定 `queue` |
 | queue | prompt 的 `delivery:queue` | Python 适配器推送时使用 |
-| interrupt | session interrupt | 未接入统一控制接口 |
+| interrupt | session interrupt | runner `interrupt` 子命令（`push.post_interrupt`；空闲返回 `interrupted:false`，是明确答复不是错误） |
 | 事件订阅 | 原生流式接口 | 未接入直接事件流传输 |
 | 双向请求/答复 | 插件工具 | 五个子端工具 + Python 原生 prompt 推送（描述符契约） |
 
@@ -57,9 +57,13 @@ python3 -m agent_link.hosts.opencode.serve --root ROOT --binding B serve \
   [--model PROVIDER/MODEL] [--config USER_OPENCODE_JSON] [--ready-timeout 60]
 
 python3 -m agent_link.hosts.opencode.serve --root ROOT --binding B status
-python3 -m agent_link.hosts.opencode.serve --root ROOT --binding B send --text '...' [--message-id ID]
+python3 -m agent_link.hosts.opencode.serve --root ROOT --binding B send --text '...' [--message-id ID] [--delivery queue|steer]
+python3 -m agent_link.hosts.opencode.serve --root ROOT --binding B interrupt
 python3 -m agent_link.hosts.opencode.serve --root ROOT --binding B stop
 ```
+
+- `send --delivery steer` 把 prompt 以 `delivery:steer` 送入活动运行（queue 则在当前轮结束后处理）；两者同一路由、同一幂等规则（`msg_<message_id>` 派生 prompt id）。`host_accepted` 只代表 serve 接受，steer 是否被模型实际采纳由会话行为证明。
+- `interrupt` 调用原生 `POST /api/session/<id>/interrupt`（无请求体），返回上游 `interrupted` 布尔：`false` 表示该 serve 当前没有本进程持有的活动执行（如空闲会话），是明确答复；401 为配置错误，404/超时/网络失败按 `failed_or_unknown` 映射，不自动重发。
 
 - 启动：`OPENCODE_SERVER_PASSWORD` 每 serve 随机生成（不复用用户 `service.json`）；会话库隔离在 `<root>/opencode-serve/<binding>/opencode.db`（稳定 per binding，重启可恢复同一会话）；`OPENCODE_CONFIG_DIR` 只生成指向本仓库插件的 wrapper，用户配置仅通过 `OPENCODE_CONFIG` 只读引用；端口冲突/插件未 active 均 fail closed。
 - 就绪：轮询 `/api/plugin` 确认 `agent-link` 为 `active`（C6），随后 `POST /api/session` 以绑定 `session_id` 预定会话，再写两描述符（`O_EXCL`、0600）。
@@ -95,8 +99,8 @@ AGENT_LINK_CREDENTIALS="$ROOT/child-credentials.json" \
 
 Python 推送按权威 Binding 的 `session_id` 直接寻址；插件不再选择或跟踪目标会话。一个专用服务/location 只运行一个目标会话。核对插件加载（runner 已做 active 握手）与工具注册，再通过父端持久化 reply/子端 answer 确认模型处理。五个子端工具与 OMP 相同。
 
-2026-10-16 模型端到端实测（GLM-5.3-Flash，独立 runtime root）：空闲会话的推送能唤醒模型并调用 `report_parent`（C1，host_accepted 且工具调用可在 session message 中看到）；ask→父模型 reply（C2，父端答复被子模型回收并回报）；ask-child→子模型 `answer_parent`（C3）；工具执行中再次推送立即 2xx 但排队，当前轮结束后才处理，不中断运行中的工具（C4）；强杀后残留描述符显式失败、显式清理后同一 DB 重启会话与历史完整恢复（C5）；每次启动均验证插件 active，未加载 fail closed（C6）。无直接远程 interrupt/stop-child；interrupt 未接入统一控制接口。
+2026-10-16 模型端到端实测（GLM-5.3-Flash，独立 runtime root）：空闲会话的推送能唤醒模型并调用 `report_parent`（C1，host_accepted 且工具调用可在 session message 中看到）；ask→父模型 reply（C2，父端答复被子模型回收并回报）；ask-child→子模型 `answer_parent`（C3）；工具执行中再次推送立即 2xx 但排队，当前轮结束后才处理，不中断运行中的工具（C4）；强杀后残留描述符显式失败、显式清理后同一 DB 重启会话与历史完整恢复（C5）；每次启动均验证插件 active，未加载 fail closed（C6）。steer/interrupt 已按三层接入：模拟（`test_opencode_push.py`）、真实隔离 serve 无模型（`test_opencode_serve.py`：steer 入箱回显、空闲 interrupt 返回 `false`、404 映射）；运行中模型的 steer 采纳与 interrupt 生效见本目录模型端到端记录。无统一 stop-child；serve 级停止用 runner `stop`。
 
 ## 清理
 
-通过 runner `stop` 停止本次专用 OpenCode 服务（优先停 supervisor，再停通信服务）；不要停止用户自己的既有服务；只停自己启动的 serve（门禁 E1）。强杀后的描述符残留必须显式核对旧进程已退出后再按 serve_id/pid 清理，不自动扩散或重建。当前适配没有直接远程 interrupt/stop-child 实现，不能套用 Pi 命令。
+通过 runner `stop` 停止本次专用 OpenCode 服务（优先停 supervisor，再停通信服务）；不要停止用户自己的既有服务；只停自己启动的 serve（门禁 E1）。会话级中断用 runner `interrupt`（只中断该 serve 上该会话的当前执行，不停 serve）；serve 级停止仍用 `stop`，二者不可混用。强杀后的描述符残留必须显式核对旧进程已退出后再按 serve_id/pid 清理，不自动扩散或重建。

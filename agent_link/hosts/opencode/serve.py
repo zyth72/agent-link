@@ -2,7 +2,10 @@
 
 Starts one dedicated ``opencode serve`` for a binding and keeps it alive with
 the CLI shape of the Pi RPC controller (``serve``/``status``/``send``/
-``stop``):
+``interrupt``/``stop``): ``send --delivery steer|queue`` parameterizes the
+upstream prompt delivery mode and ``interrupt`` calls the native session
+interrupt route (``interrupted: false`` explicitly means no active execution,
+not an error).
 
 - integration-generated ``OPENCODE_SERVER_PASSWORD`` (one per serve, never the
   user's ``service.json`` credential);
@@ -626,32 +629,71 @@ def status_binding(root, binding_id: str) -> dict:
     return result
 
 
-def send_binding(root, binding_id: str, text: str, *, message_id: str | None = None,
-                 timeout: float = push.TIMEOUT_SECONDS) -> dict:
-    """Send raw prompt text through the frozen descriptors (no binding/role render)."""
+def _opencode_side(root, binding_id: str) -> tuple[dict, str, str]:
+    """Resolve (binding, role, session_id) for the opencode side of a binding."""
     binding = _read_binding(root, binding_id)
-    role = "child" if binding.get("child_framework") == "opencode" else "parent"
-    if binding.get(f"{role}_framework") != "opencode":
+    if binding.get("child_framework") == "opencode":
+        role = "child"
+    elif binding.get("parent_framework") == "opencode":
+        role = "parent"
+    else:
         raise ValidationError(
-            f"binding {binding_id} has no opencode side "
-            f"(child={binding.get('child_framework')!r}, parent={binding.get('parent_framework')!r})"
+            f"binding {binding_id} has no opencode side (child={binding.get('child_framework')!r}, "
+            f"parent={binding.get('parent_framework')!r})"
         )
     session_id = validate_identifier(binding[f"{role}_session_id"], f"{role}_session_id")
+    return binding, role, session_id
+
+
+def _require_session_descriptor(session_id: str) -> None:
     if not push.session_descriptor_path("opencode", session_id).is_file():
         raise NotFoundError(
             f"no opencode session descriptor for {session_id!r}; run serve first"
         )
+
+
+def send_binding(root, binding_id: str, text: str, *, message_id: str | None = None,
+                 timeout: float = push.TIMEOUT_SECONDS,
+                 delivery: str = push.DELIVERY) -> dict:
+    """Send raw prompt text through the frozen descriptors (no binding/role render).
+
+    ``delivery`` selects the upstream mode: ``queue`` (default; processed
+    after the current turn) or ``steer`` (injected into the active run).
+    """
+    _binding, _role, session_id = _opencode_side(root, binding_id)
+    _require_session_descriptor(session_id)
     if message_id is None:
         message_id = f"send-{uuid.uuid4().hex}"
     detail = push.post_prompt(
-        "opencode", session_id, text, message_id=message_id, timeout=timeout
+        "opencode", session_id, text, message_id=message_id, timeout=timeout,
+        delivery=delivery,
     )
     return {
         "binding_id": binding_id,
         "session_id": session_id,
         "message_id": message_id,
+        "delivery": delivery,
         "accepted": True,
         "detail": detail,
+    }
+
+
+def interrupt_binding(root, binding_id: str, *, timeout: float = push.TIMEOUT_SECONDS) -> dict:
+    """Interrupt the bound session's active execution on its dedicated serve.
+
+    Returns the upstream ``interrupted`` flag: ``False`` is an explicit
+    answer that this serve owned no active execution (for example an idle
+    session), not a failure.  Descriptor/transport problems raise exactly
+    like the other client commands.
+    """
+    _binding, _role, session_id = _opencode_side(root, binding_id)
+    _require_session_descriptor(session_id)
+    interrupted = push.post_interrupt("opencode", session_id, timeout=timeout)
+    return {
+        "binding_id": binding_id,
+        "session_id": session_id,
+        "interrupted": interrupted,
+        "detail": f"interrupt:opencode/{session_id}",
     }
 
 
@@ -778,6 +820,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text", default=None)
     p.add_argument("--text-file", default=None)
     p.add_argument("--message-id", default=None, dest="message_id")
+    p.add_argument(
+        "--delivery",
+        choices=push.DELIVERY_MODES,
+        default=push.DELIVERY,
+        help="queue: process after the current turn (default); steer: inject into the active run",
+    )
+    p.add_argument("--timeout", type=float, default=push.TIMEOUT_SECONDS)
+
+    p = sub.add_parser(
+        "interrupt",
+        help="interrupt the bound session's active execution on its serve",
+    )
     p.add_argument("--timeout", type=float, default=push.TIMEOUT_SECONDS)
 
     p = sub.add_parser("stop", help="stop the dedicated serve and remove its descriptors")
@@ -859,8 +913,12 @@ def _run_client(args) -> int:
                 text,
                 message_id=args.message_id,
                 timeout=args.timeout,
+                delivery=args.delivery,
             )
         )
+        return 0
+    if args.command == "interrupt":
+        _print_result(interrupt_binding(args.root, binding_id, timeout=args.timeout))
         return 0
     if args.command == "stop":
         _print_result(stop_binding(args.root, binding_id, stop_grace=args.stop_grace))

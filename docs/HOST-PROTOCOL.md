@@ -237,14 +237,15 @@ serve 描述符字段：`protocol`/`framework`（同值）、`serve_id`（与会
 
 请求与失败映射：
 
-- 固定路由 `POST /api/session/<已校验 session_id>/prompt`，body `{"id": "msg_" + message_id, "text": 渲染后的 prompt, "delivery": "queue"}`；上游要求 prompt id 以 `msg_` 开头，故用确定性派生 `msg_<message_id>`（同 message_id 原样重放派生同一 prompt id）；不发送 `resume`，调度遵循框架默认。
+- 固定路由 `POST /api/session/<已校验 session_id>/prompt`，body `{"id": "msg_" + message_id, "text": 渲染后的 prompt, "delivery": "queue"}`；上游要求 prompt id 以 `msg_` 开头，故用确定性派生 `msg_<message_id>`（同 message_id 原样重放派生同一 prompt id）；不发送 `resume`，调度遵循框架默认。Agent Link 消息分发的 `delivery` 固定 `queue`；编排层（runner `send --delivery steer` / `post_prompt(delivery=...)`）可参数化为上游枚举 `"queue" | "steer"`（steer 注入当前活动运行，queue 排队到当前轮后），响应回显 `delivery` 不一致时不记 `host_accepted`。
+- 会话级中断走固定路由 `POST /api/session/<已校验 session_id>/interrupt`（无请求体，同一描述符契约与认证），成功响应 `{"interrupted": bool}`：`false` 是"该 serve 无本进程持有的活动执行"的明确答复，不是投递失败。runner `interrupt` 子命令即此路由；401 配置错误不重试、404/超时/网络失败/无布尔标志按 `failed_or_unknown` 映射，均不自动重发。
 - 只有上游 2xx 且响应 JSON 的 `sessionID` 回显与目标一致（若含 `id` 也必须等于 `msg_<message_id>`）才记录 `host_accepted`。
 - 401：配置错误，不重试；404：目标会话不存在，`failed_or_unknown` 且不自动重发；其他非 2xx、超时、网络失败、响应身份不匹配：`failed_or_unknown`。仅同 `message_id`（派生同一 `msg_<message_id>` prompt id）允许幂等重放，上游首条 admission 生效。
 - 密码与 Authorization 禁入日志、审计 detail 与异常文本（C3），并有模拟单测断言。
 
 能力声明（2026-10-16 模型端到端切片 3c 后按实测更新）：父端 `notification_transport=opencode_prompt_http`、`delivery=queue`、`resume=framework_default_schedules`（不发送 `resume`，C1/C4 实测默认调度生效）、`busy_behavior=queue_after_turn`、`wake_after_turn=verified`、`polling=false`；子端 `delivery_transport=opencode_prompt_http`、`wake_child=native_injection`、`busy_behavior=queue_after_turn`、`polling=false`。C1（空闲唤醒 report_parent）、C2（ask→父模型实际 reply）、C3（ask-child→子模型 answer）、C4（工具执行中投递：2xx 接受、排队、当前轮结束后处理）、C6（每次启动插件 active 握手，未加载 fail closed）均已实测；详细证据见 `runtime/oc-push-impl-20261016-091321/impl-report.md` §9。
 
-自管 serve runner（切片 3a）：`python3 -m agent_link.hosts.opencode.serve --root ROOT --binding B serve|status|send|stop`。`serve` 以集成生成的 `OPENCODE_SERVER_PASSWORD`、隔离会话库（`<root>/opencode-serve/<binding>/opencode.db`，重启可恢复同一会话）和只含插件 wrapper 的 `OPENCODE_CONFIG_DIR` 启动真实 `opencode serve`；用户配置仅通过 `OPENCODE_CONFIG` 只读引用，不复制、不修改。就绪以 `/api/plugin` 中 `agent-link` 为 `active` 为准，随后用 `POST /api/session` 预定绑定会话并写描述符。C5 实测语义：进程被强杀后描述符保留且 pid 已死——`status` 报 `stale`、推送明确失败、runner 拒绝在残留描述符上启动，需按 E1 显式确认旧进程已退出后清理；数据库保留时，重启 serve 会采用同一 session id 并保留全部历史（已验证），进程/描述符不会自动重建。优雅 `stop` 优先向 `supervisor_pid` 发 SIGTERM，只删自己的描述符。
+自管 serve runner（切片 3a）：`python3 -m agent_link.hosts.opencode.serve --root ROOT --binding B serve|status|send|interrupt|stop`。`serve` 以集成生成的 `OPENCODE_SERVER_PASSWORD`、隔离会话库（`<root>/opencode-serve/<binding>/opencode.db`，重启可恢复同一会话）和只含插件 wrapper 的 `OPENCODE_CONFIG_DIR` 启动真实 `opencode serve`；用户配置仅通过 `OPENCODE_CONFIG` 只读引用，不复制、不修改。就绪以 `/api/plugin` 中 `agent-link` 为 `active` 为准，随后用 `POST /api/session` 预定绑定会话并写描述符。`send --delivery queue|steer` 参数化上游投递模式；`interrupt` 调用上述原生中断路由。C5 实测语义：进程被强杀后描述符保留且 pid 已死——`status` 报 `stale`、推送明确失败、runner 拒绝在残留描述符上启动，需按 E1 显式确认旧进程已退出后清理；数据库保留时，重启 serve 会采用同一 session id 并保留全部历史（已验证），进程/描述符不会自动重建。优雅 `stop` 优先向 `supervisor_pid` 发 SIGTERM，只删自己的描述符。steer/interrupt 的验证分层：模拟与真实隔离 serve（无模型）已入库（`tests/test_opencode_push.py`、`tests/test_opencode_serve.py`）；运行中模型的 steer 采纳与 interrupt 生效以模型端到端记录为准，`host_accepted` 不代表模型已处理。
 
 ### 6.4 父→子消息：ask-child 与 send-child
 

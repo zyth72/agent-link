@@ -3,7 +3,8 @@
 Implements the slice-1 surface of the de-polling migration against the real
 OpenCode v2 shape: ``POST /api/session/<session_id>/prompt`` with HTTP Basic
 auth (``opencode:<password>``), the ``Session.Inbox.User`` response, per-id
-idempotency (first admission wins) and configurable status/redirect/delay for
+idempotency (first admission wins), the ``POST .../interrupt`` route with its
+``SessionInterruptResponse`` and configurable status/redirect/delay for
 failure mapping.  No real ``opencode`` process, plugin or model is involved.
 """
 
@@ -34,6 +35,7 @@ class MockOpenCodeServe:
         respond_status: int | None = None,
         respond_body: dict | None = None,
         delay_seconds: float = 0.0,
+        interrupt_result: bool = False,
     ):
         self.session_id = session_id
         self.password = password
@@ -42,8 +44,10 @@ class MockOpenCodeServe:
         self.respond_status = respond_status
         self.respond_body = respond_body
         self.delay_seconds = delay_seconds
+        self.interrupt_result = interrupt_result
         self.requests: list[dict] = []
         self.prompts: list[dict] = []
+        self.interrupts: list[dict] = []
         self.responses: list[dict] = []
         self.admissions: dict[str, dict] = {}
         outer = self
@@ -77,6 +81,19 @@ class MockOpenCodeServe:
                     self.send_header("Location", outer.redirect_to)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
+                    return
+                if self.path == f"/api/session/{outer.session_id}/interrupt":
+                    # Native interrupt route: no request body, and the
+                    # response is the SessionInterruptResponse (or the
+                    # configured failure for mapping tests).
+                    outer.interrupts.append({"path": self.path, "body": body})
+                    if outer.respond_status is not None:
+                        self._send(
+                            outer.respond_status,
+                            outer.respond_body if outer.respond_body is not None else {},
+                        )
+                        return
+                    self._send(200, {"data": {"interrupted": outer.interrupt_result}})
                     return
                 try:
                     payload = json.loads(body.decode("utf-8"))

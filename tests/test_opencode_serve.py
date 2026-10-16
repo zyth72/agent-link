@@ -372,6 +372,63 @@ class OpenCodeServeRealCase(unittest.TestCase):
             set(listeners), {"0100007F"}, "the serve must listen on 127.0.0.1 only"
         )
 
+    def test_steer_delivery_and_interrupt_on_the_real_serve(self):
+        password = self.server_descriptor["password"]
+        # steer is a delivery-mode value on the same prompt route (no model:
+        # resume=False admits the message without scheduling a run).
+        detail = push.post_prompt(
+            "opencode",
+            self.session_id,
+            "steer me later",
+            message_id="msg_steer_1",
+            resume=False,
+            delivery="steer",
+        )
+        self.assertEqual(detail, f"push:opencode/{self.session_id}#msg_steer_1")
+        status, body = serve._api(
+            self.endpoint, password, "GET", f"/api/session/{self.session_id}/inbox"
+        )
+        self.assertEqual(status, 200)
+        steered = [item for item in serve._unwrap(body) if item["id"] == "msg_msg_steer_1"]
+        self.assertEqual(len(steered), 1)
+        self.assertEqual(steered[0]["delivery"], "steer")
+
+        # An idle session is an explicit interrupted:false, not an error.
+        self.assertFalse(push.post_interrupt("opencode", self.session_id))
+
+        # The runner client surfaces the same answer and never the password.
+        proc = subprocess.run(
+            RUNNER_CLI
+            + ["--root", str(self.root), "--binding", "runner-b", "interrupt"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertIs(result["interrupted"], False)
+        self.assertEqual(result["session_id"], self.session_id)
+        self.assertNotIn(self.server_descriptor["password"], proc.stdout)
+
+        # A descriptor for a session the serve does not own maps 404 the same
+        # way as the prompt route.
+        push.write_session_descriptor(
+            {
+                "protocol": push.PROTOCOL,
+                "framework": "opencode",
+                "session_id": "ses_missing_interrupt_1",
+                "endpoint": self.endpoint,
+                "pid": self.ready["serve_pid"],
+                "serve_id": self.ready["serve_id"],
+                "managed": True,
+                "credential_kind": "server_descriptor",
+            }
+        )
+        with self.assertRaises(DeliveryFailure) as caught:
+            push.post_interrupt("opencode", "ses_missing_interrupt_1")
+        self.assertIn("404", str(caught.exception))
+
     def test_status_cli_reports_ready_session_and_plugin(self):
         proc = subprocess.run(
             RUNNER_CLI
@@ -554,7 +611,7 @@ class OpenCodeFailureCase(RunnerEnvCase):
 
     def test_missing_descriptors_fail_without_spawning(self):
         self.bind("fail-b", child_session="ses_absent_1")
-        for command in ("status", "send", "stop"):
+        for command in ("status", "send", "interrupt", "stop"):
             with self.subTest(command=command):
                 args = [command]
                 if command == "send":

@@ -167,7 +167,7 @@ python3 -m agent_link.host --root /abs/runtime --binding live-001 \
 
 ## OpenCode 父端/子端（可选）
 
-OpenCode 用 v2 插件 `extensions/opencode/agent-link.ts`（本机验证 2.0.29；v1 插件形态会被拒绝加载）：把文件放入 `~/.config/opencode/plugin/` 后每个会话自动加载。插件只注册五个子端工具（与 OMP 同名同语义），不再有文件 watcher；父→子投递由 Python 适配器直连框架原生 `POST /api/session/:id/prompt`（Basic 认证 + 会话/serve 描述符契约，见 [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md) §6.3）。集成自管 serve 与描述符写入的 runner 编排属切片 3；模型端到端（空闲唤醒/busy 投递）尚未验收。
+OpenCode 用 v2 插件 `extensions/opencode/agent-link.ts`（本机验证 2.0.29；v1 插件形态会被拒绝加载）：把文件放入 `~/.config/opencode/plugin/` 后每个会话自动加载。插件只注册五个子端工具（与 OMP 同名同语义），不再有文件 watcher；父→子投递由 Python 适配器直连框架原生 `POST /api/session/:id/prompt`（Basic 认证 + 会话/serve 描述符契约，见 [docs/HOST-PROTOCOL.md](docs/HOST-PROTOCOL.md) §6.3）。自管 serve runner 支持 `send --delivery queue|steer` 与 `interrupt` 子命令（会话级中断，空闲返回 `interrupted:false`）；集成自管 serve 与描述符写入的 runner 编排见 [OpenCode README](agent_link/hosts/opencode/README.md)。模型端到端（空闲唤醒/busy 投递）验收记录同 §6.3。
 
 ## Codex 父端助手（agent_link.hosts.codex.cli，推荐）
 
