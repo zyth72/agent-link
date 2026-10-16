@@ -283,7 +283,7 @@ class OpenCodeChildE2ECase(unittest.TestCase):
         self.assertEqual(len(self.serve.prompts), 2)
         self.assertEqual(
             [prompt["id"] for prompt in self.serve.prompts],
-            [ids["report_message_id"], ids["question_message_id"]],
+            ["msg_" + ids["report_message_id"], "msg_" + ids["question_message_id"]],
         )
         self.assertEqual([prompt["delivery"] for prompt in self.serve.prompts], ["queue", "queue"])
         self.assertIn("[agent-link:report]", self.serve.prompts[0]["text"])

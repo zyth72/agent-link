@@ -22,8 +22,9 @@ class OpenCodeChildAdapter(ChildAdapter):
             "driver": "agent_link.hosts.opencode.child:OpenCodeChildAdapter",
             "delivery_transport": "opencode_prompt_http",
             "delivery": "queue",
-            "resume": "framework_default_unknown",
-            "wake_child": "unknown",
+            "resume": "framework_default_schedules",
+            "wake_child": "native_injection",
+            "busy_behavior": "queue_after_turn",
             "polling": False,
             "processed_confirmation": "answer_parent persisted state",
         }

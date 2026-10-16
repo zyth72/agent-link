@@ -157,7 +157,7 @@ class ParentChildCliCase(unittest.TestCase):
         prompts = self.wait_for_prompts(1)
         self.assertEqual(len(prompts), 1, "ask-child must push one prompt before waiting")
         prompt = prompts[0]
-        self.assertEqual(prompt["id"], "pm-1")
+        self.assertEqual(prompt["id"], "msg_pm-1")
         self.assertEqual(prompt["delivery"], "queue")
         self.assertIn("[agent-link:parent-ask]", prompt["text"])
         self.assertIn("binding_id: pc-b", prompt["text"])
@@ -287,7 +287,7 @@ class ParentChildCliCase(unittest.TestCase):
         self.assertLess(elapsed, 15, "send-child must return without waiting for the reply")
         prompts = self.wait_for_prompts(1)
         self.assertEqual(len(prompts), 1, "send-child must push exactly one prompt")
-        self.assertEqual(prompts[0]["id"], "pm-s")
+        self.assertEqual(prompts[0]["id"], "msg_pm-s")
         self.assertEqual(prompts[0]["delivery"], "queue")
         self.assertIn("[agent-link:parent-ask]", prompts[0]["text"])
         self.assertIn("fire and forget", prompts[0]["text"])

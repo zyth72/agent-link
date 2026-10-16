@@ -775,7 +775,7 @@ class PiRpcCase(unittest.TestCase):
         self.processes.append(asker)
         self.wait_for(lambda: len(serve.prompts) == 1, message="opencode push prompt")
         prompt = serve.prompts[0]
-        self.assertEqual(prompt["id"], "pm-oc")
+        self.assertEqual(prompt["id"], "msg_pm-oc")
         self.assertEqual(prompt["delivery"], "queue")
         self.assertIn("[agent-link:parent-ask]", prompt["text"])
         self.assertIn("request_id: rq-oc", prompt["text"])

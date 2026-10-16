@@ -24,11 +24,12 @@ class OpenCodeParentAdapter(ParentAdapter):
             "notification_transport": "opencode_prompt_http",
             "receive_mode": "session_injection",
             "delivery": "queue",
-            # No resume field is sent; scheduling follows the framework
-            # default and busy/wake behavior is [推断], not verified.
-            "resume": "framework_default_unknown",
-            "busy_behavior": "unknown",
-            "wake_after_turn": "unknown",
+            # No resume field is sent; C1/C4 observed the framework default
+            # scheduling an idle session and processing a queued prompt after
+            # the current turn (model end-to-end, slice 3c).
+            "resume": "framework_default_schedules",
+            "busy_behavior": "queue_after_turn",
+            "wake_after_turn": "verified",
             "polling": False,
         }
 

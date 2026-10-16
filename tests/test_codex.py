@@ -539,7 +539,7 @@ class CodexCase(unittest.TestCase):
             time.sleep(0.05)
         self.assertTrue(serve.prompts, "ask-child must push one prompt before waiting")
         prompt = serve.prompts[0]
-        self.assertEqual(prompt["id"], "pm-c")
+        self.assertEqual(prompt["id"], "msg_pm-c")
         self.assertEqual(prompt["delivery"], "queue")
         self.assertIn("[agent-link:parent-ask]", prompt["text"])
         self.assertIn("request_id: rq-c", prompt["text"])
@@ -619,7 +619,7 @@ class CodexCase(unittest.TestCase):
         while time.time() < deadline and not serve.prompts:
             time.sleep(0.05)
         self.assertEqual(len(serve.prompts), 1, "send-child must push one prompt")
-        self.assertEqual(serve.prompts[0]["id"], "pm-s")
+        self.assertEqual(serve.prompts[0]["id"], "msg_pm-s")
         self.assertIn("status?", serve.prompts[0]["text"])
 
         replay = self.run_codex(*send_args, timeout=30)

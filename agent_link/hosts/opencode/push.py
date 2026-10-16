@@ -69,6 +69,91 @@ def server_descriptor_path(framework: str, serve_id: str) -> Path:
     return session_dir() / framework / SERVERS_DIR_NAME / f"{serve_id}.json"
 
 
+def write_session_descriptor(descriptor: dict, *, sessions=None) -> Path:
+    """Create the session descriptor 0600 with ``O_EXCL`` (never replace).
+
+    Raises ``FileExistsError`` when a descriptor already exists so callers can
+    fail explicitly instead of mixing two generations of descriptors.
+    """
+    path = (Path(sessions) if sessions is not None else session_dir()) / descriptor["framework"] / (
+        f"{descriptor['session_id']}.json"
+    )
+    return _write_private_exclusive(path, descriptor)
+
+
+def write_server_descriptor(descriptor: dict, *, sessions=None) -> Path:
+    """Create the serve descriptor 0600 with ``O_EXCL`` (never replace)."""
+    path = (
+        (Path(sessions) if sessions is not None else session_dir())
+        / descriptor["framework"]
+        / SERVERS_DIR_NAME
+        / f"{descriptor['serve_id']}.json"
+    )
+    return _write_private_exclusive(path, descriptor)
+
+
+def _write_private_exclusive(path: Path, payload: dict) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def remove_descriptor_if_matches(path: Path, *, serve_id: str, pid: int) -> bool:
+    """Remove a descriptor only when it still names this serve (E1 cleanup)."""
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(current, dict):
+        return False
+    if current.get("serve_id") != serve_id or current.get("pid") != pid:
+        return False
+    try:
+        path.unlink()
+    except OSError:
+        return False
+    return True
+
+
+def read_session_descriptor(framework: str, session_id: str, *, sessions=None) -> dict:
+    """Raw session descriptor for runner/tooling; raises when missing or invalid."""
+    validate_identifier(framework, "framework")
+    validate_identifier(session_id, "session_id")
+    base = Path(sessions) if sessions is not None else session_dir()
+    path = base / framework / f"{session_id}.json"
+    _require_private_file(path, "session descriptor")
+    return _load_json_object(path, "session descriptor")
+
+
+def read_server_descriptor(framework: str, serve_id: str, *, sessions=None) -> dict:
+    """Raw serve descriptor for runner/tooling; raises when missing or invalid."""
+    validate_identifier(framework, "framework")
+    validate_identifier(serve_id, "serve_id")
+    base = Path(sessions) if sessions is not None else session_dir()
+    path = base / framework / SERVERS_DIR_NAME / f"{serve_id}.json"
+    _require_private_file(path, "serve descriptor")
+    return _load_json_object(path, "serve descriptor")
+
+
 def _require_private_file(path: Path, label: str) -> None:
     """The credential contract requires 0600; fail closed on group/other bits."""
     try:
@@ -196,20 +281,8 @@ def _load_password(framework: str, descriptor: dict, path: Path, endpoint: str) 
     return password
 
 
-def deliver(root, binding, message, *, role: str) -> str:
-    """POST one rendered prompt to the bound OpenCode session.
-
-    Returns the audit detail string (never contains the password); raises
-    :class:`DeliveryFailure` on any missing/mismatched descriptor, transport
-    failure, timeout, non-2xx response or unacknowledged session, which the
-    core records as ``failed_or_unknown`` with no automatic resend.
-    """
-    framework = binding[f"{role}_framework"]
-    session_id = binding[f"{role}_session_id"]
-    validate_identifier(framework, "framework")
-    validate_identifier(session_id, "session_id")
-    validate_identifier(message["message_id"], "message_id")
-
+def _load_credentials(framework: str, session_id: str) -> tuple[str, str]:
+    """Load and validate the session/serve descriptors; return endpoint+password."""
     path = session_descriptor_path(framework, session_id)
     _require_private_file(path, "session descriptor")
     descriptor = _load_json_object(path, "session descriptor")
@@ -231,13 +304,59 @@ def deliver(root, binding, message, *, role: str) -> str:
             f"opencode serve process is not running (session descriptor pid): {path}"
         )
     password = _load_password(framework, descriptor, path, endpoint)
+    return endpoint, password
 
-    renderer = build_parent_prompt if role == "parent" else build_child_prompt
-    prompt = renderer(root, binding, message)
-    body = json.dumps(
-        {"id": message["message_id"], "text": prompt, "delivery": DELIVERY},
-        ensure_ascii=False,
-    ).encode("utf-8")
+
+def post_prompt(
+    framework: str,
+    session_id: str,
+    prompt: str,
+    *,
+    message_id: str,
+    timeout: float | None = None,
+    resume: bool | None = None,
+) -> str:
+    """POST raw prompt text through the frozen descriptors.
+
+    Shared by the host adapters (which render a prompt first) and the runner
+    ``send`` command.  ``resume`` is normally left ``None`` so the framework
+    default applies (the adapters never send it); passing it explicitly is
+    for orchestration and no-model real-interface tests.  Returns the audit
+    detail string; raises :class:`DeliveryFailure` with the same mapping as
+    :func:`deliver`.
+    """
+    validate_identifier(framework, "framework")
+    validate_identifier(session_id, "session_id")
+    validate_identifier(message_id, "message_id")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise DeliveryFailure("opencode prompt must be a non-empty string")
+    endpoint, password = _load_credentials(framework, session_id)
+    return _post_prompt(
+        endpoint,
+        session_id,
+        password,
+        prompt,
+        message_id,
+        TIMEOUT_SECONDS if timeout is None else timeout,
+        resume=resume,
+    )
+
+
+def _post_prompt(
+    endpoint: str,
+    session_id: str,
+    password: str,
+    prompt: str,
+    message_id: str,
+    timeout: float,
+    *,
+    resume: bool | None = None,
+) -> str:
+    prompt_id = f"msg_{message_id}"
+    body_payload = {"id": prompt_id, "text": prompt, "delivery": DELIVERY}
+    if resume is not None:
+        body_payload["resume"] = resume
+    body = json.dumps(body_payload, ensure_ascii=False).encode("utf-8")
     if len(body) > MAX_BODY_BYTES:
         raise DeliveryFailure(f"opencode prompt exceeds {MAX_BODY_BYTES} bytes")
 
@@ -258,7 +377,7 @@ def deliver(root, binding, message, *, role: str) -> str:
     # No proxy environment, no redirect following: only the descriptor origin.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     try:
-        with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
+        with opener.open(request, timeout=timeout) as response:
             status = response.status
             data = response.read(MAX_BODY_BYTES + 1)
     except urllib.error.HTTPError as error:
@@ -294,11 +413,35 @@ def deliver(root, binding, message, *, role: str) -> str:
         raise DeliveryFailure(
             "opencode push response is not valid JSON; failed_or_unknown"
         ) from None
+    # OpenCode v2 wraps responses in {"data": ...}; accept the unwrapped form
+    # too so older fixtures stay readable.
+    if isinstance(result, dict) and isinstance(result.get("data"), dict):
+        result = result["data"]
     if not isinstance(result, dict) or result.get("sessionID") != session_id:
         raise DeliveryFailure(
             "opencode push was not acknowledged for the bound session; "
             "not recorded as host_accepted"
         )
-    if "id" in result and result.get("id") != message["message_id"]:
+    if "id" in result and result.get("id") != prompt_id:
         raise DeliveryFailure("opencode push acknowledged a different prompt id")
-    return f"push:opencode/{session_id}#{message['message_id']}"
+    return f"push:opencode/{session_id}#{message_id}"
+
+
+def deliver(root, binding, message, *, role: str) -> str:
+    """POST one rendered prompt to the bound OpenCode session.
+
+    Returns the audit detail string (never contains the password); raises
+    :class:`DeliveryFailure` on any missing/mismatched descriptor, transport
+    failure, timeout, non-2xx response or unacknowledged session, which the
+    core records as ``failed_or_unknown`` with no automatic resend.
+    """
+    framework = binding[f"{role}_framework"]
+    session_id = binding[f"{role}_session_id"]
+    renderer = build_parent_prompt if role == "parent" else build_child_prompt
+    prompt = renderer(root, binding, message)
+    return post_prompt(
+        framework,
+        session_id,
+        prompt,
+        message_id=message["message_id"],
+    )

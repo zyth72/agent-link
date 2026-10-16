@@ -107,7 +107,8 @@ class MockOpenCodeServe:
                     }
                     outer.admissions[prompt_id] = admission
                 outer.responses.append(admission)
-                self._send(200, admission)
+                # OpenCode v2 wraps every response in {"data": ...}.
+                self._send(200, {"data": admission})
 
             def _send(self, status: int, payload: dict):
                 data = json.dumps(payload).encode("utf-8")

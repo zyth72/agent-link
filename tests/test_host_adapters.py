@@ -117,14 +117,16 @@ class AdapterEntryCase(unittest.TestCase):
         self.assertEqual(opencode_capabilities["notification_transport"], "opencode_prompt_http")
         self.assertEqual(opencode_capabilities["delivery"], "queue")
         self.assertFalse(opencode_capabilities["polling"])
-        self.assertEqual(opencode_capabilities["busy_behavior"], "unknown")
-        self.assertEqual(opencode_capabilities["wake_after_turn"], "unknown")
+        self.assertEqual(opencode_capabilities["busy_behavior"], "queue_after_turn")
+        self.assertEqual(opencode_capabilities["wake_after_turn"], "verified")
+        self.assertEqual(opencode_capabilities["resume"], "framework_default_schedules")
         opencode_child = opencode.get_adapters().child
         child_capabilities = opencode_child.capabilities()
         self.assertEqual(child_capabilities["delivery_transport"], "opencode_prompt_http")
         self.assertEqual(child_capabilities["delivery"], "queue")
         self.assertFalse(child_capabilities["polling"])
-        self.assertEqual(child_capabilities["wake_child"], "unknown")
+        self.assertEqual(child_capabilities["wake_child"], "native_injection")
+        self.assertEqual(child_capabilities["busy_behavior"], "queue_after_turn")
 
     def test_old_module_paths_are_gone(self):
         for name in (

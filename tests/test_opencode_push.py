@@ -154,7 +154,7 @@ class OpenCodePushCase(unittest.TestCase):
         self.assertEqual(request["authorization"], expected)
         prompt = server.prompts[0]
         self.assertEqual(set(prompt), {"id", "text", "delivery"}, "no resume field is sent")
-        self.assertEqual(prompt["id"], "m-r")
+        self.assertEqual(prompt["id"], "msg_m-r")
         self.assertEqual(prompt["delivery"], "queue")
         self.assertIn("[agent-link:report]", prompt["text"])
         self.assertIn("message_id: m-r", prompt["text"])
@@ -167,7 +167,7 @@ class OpenCodePushCase(unittest.TestCase):
         detail = OpenCodeChildAdapter().deliver(self.root, self.binding(), self.ask_child())
         self.assertEqual(detail, "push:opencode/child-1#m-c")
         prompt = server.prompts[0]
-        self.assertEqual(prompt["id"], "m-c")
+        self.assertEqual(prompt["id"], "msg_m-c")
         self.assertEqual(prompt["delivery"], "queue")
         self.assertIn("[agent-link:parent-ask]", prompt["text"])
         self.assertIn("request_id: rq-1", prompt["text"])
@@ -181,9 +181,9 @@ class OpenCodePushCase(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(server.requests), 2, "the retry is sent with the same id")
         self.assertEqual(len(server.prompts), 2)
-        self.assertEqual(server.prompts[0]["id"], "m-dup")
-        self.assertEqual(server.prompts[1]["id"], "m-dup")
-        self.assertIn("first text", server.admissions["m-dup"]["payload"]["text"])
+        self.assertEqual(server.prompts[0]["id"], "msg_m-dup")
+        self.assertEqual(server.prompts[1]["id"], "msg_m-dup")
+        self.assertIn("first text", server.admissions["msg_m-dup"]["payload"]["text"])
         self.assertEqual(
             server.responses[0],
             server.responses[1],
@@ -410,7 +410,7 @@ class OpenCodePushCase(unittest.TestCase):
         server = self.serve(
             "parent-1",
             respond_status=200,
-            respond_body={"id": "m-r", "sessionID": "someone-else", "type": "user"},
+            respond_body={"data": {"id": "m-r", "sessionID": "someone-else", "type": "user"}},
         )
         self.write_pair(server)
         with self.assertRaises(DeliveryFailure) as caught:
@@ -420,12 +420,22 @@ class OpenCodePushCase(unittest.TestCase):
         server = self.serve(
             "parent-1",
             respond_status=200,
-            respond_body={"id": "different", "sessionID": "parent-1", "type": "user"},
+            respond_body={"data": {"id": "different", "sessionID": "parent-1", "type": "user"}},
         )
         self.write_pair(server)
         with self.assertRaises(DeliveryFailure) as caught:
             self.notify()
         self.assertIn("different prompt id", str(caught.exception))
+
+    def test_unwrapped_response_envelope_is_also_accepted(self):
+        server = self.serve(
+            "parent-1",
+            respond_status=200,
+            respond_body={"id": "msg_m-r", "sessionID": "parent-1", "type": "user"},
+        )
+        self.write_pair(server)
+        detail = self.notify()
+        self.assertEqual(detail, "push:opencode/parent-1#m-r")
 
     def test_oversized_prompt_is_rejected_before_contact(self):
         server = self.serve("parent-1")
