@@ -1,0 +1,20 @@
+{
+  "name": "agent-link",
+  "version": "0.1.0",
+  "description": "Thin cross-framework agent task reporting and decision-request layer.",
+  "author": {
+    "name": "Agent Link contributors"
+  },
+  "license": "MIT",
+  "keywords": ["agents", "intercom", "task-binding", "codex"],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Agent Link",
+    "shortDescription": "Parent/child agent reporting, questions and replies",
+    "longDescription": "Bind Codex desktop parent chats to Pi, OMP or OpenCode child sessions, report progress, ask questions and reply through persisted local state.",
+    "developerName": "Agent Link contributors",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Write"]
+  }
+}

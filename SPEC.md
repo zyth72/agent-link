@@ -46,11 +46,15 @@ get_request(binding, request_id) 返回持久化状态和答复。
 
 在外部调用前持久化 dispatching；异常或中断状态不可盲目重发。v0.1 不自动重试通知；重复 CLI 调用也不得自动重复投递。未确定投递和请求超时分别记录，不能合并。出错时保留可查询请求，方便父端人工恢复。
 
+Codex 桌面补充（向后兼容的语义细化）：当前桌面传输环境可按父 session 登记为私有连接描述符（默认 `~/.agent-link/codex-connections/`，目录 0700、文件 0600，只存白名单传输变量，不存完整环境/凭据）。通知时每次读取最新描述符并只覆盖传输字段；不修改进程全局环境。缺少描述符且继承环境可用时保持旧行为。登记只表示连接信息存在，不表示管道/进程存活或模型已处理。
+
+只有**调用绑定的外部 notifier 之前**即可证明未提交的失败（缺少连接/管道环境、描述符损坏或身份不匹配、notifier 不支持显式 env）才写结构化 `certainty=not_sent` 详情；外部调用之后的 ENOENT/超时/异常保持 `failed_or_unknown` 且详情视为 unknown，禁止按错误字符串归类。显式 `recover-notifications` 可人工重放这些 not_sent 消息：跨进程 SQLite compare-and-set 领取，保留消息 id 与请求 deadline，跳过过期/已回答 ask，绝不重放 host_accepted/dispatching/unknown，也不提供 force-unknown 或 exactly-once 承诺。
+
 ## 6. 能力声明
 
 使用 JSON 声明 notification_transport、receive_mode、reply_mode、busy_behavior、wake_after_turn、spawn、cancel。不确定值必须为 unknown，不以框架名称推断能力。
 
-当前 Codex 适配：notification_transport=desktop_bridge；receive_mode=host_injection；busy_behavior=unknown；wake_after_turn=unknown。
+当前 Codex 适配：notification_transport=desktop_bridge；connection_registration=session_start_hook_or_manual_per_session；connection_liveness=unknown_registration_is_not_health；delivery_recovery=explicit_not_sent_only；receive_mode=host_injection；busy_behavior=unknown；wake_after_turn=unknown。
 当前 Pi 适配：reply_mode=blocking_tool_file_poll；spawn=false；cancel=false。
 当前 OMP 适配：notification_transport=session_bridge_file；receive_mode=session_injection；reply_mode=blocking_tool_file_poll；spawn=false；cancel=false（busy_behavior/wake_after_turn=unknown）。
 这些值描述本适配方式，不代表框架全部原生能力。
@@ -70,6 +74,7 @@ answer --binding ID --request-id ID --message-id ID --answer TEXT
 get-parent-request --binding ID --request-id ID
 list-parent-requests --binding ID [--pending]
 list-bindings [--parent-session-id ID] [--child-session-id ID] [--parent-framework F] [--child-framework F]
+recover-notifications --binding ID [--message-id ID ...]
 
 ask-child/answer 是父→子通道（语义与 ask/reply 镜像，HOST-PROTOCOL §6.2）。bind 还会把绑定写入用户级绑定索引（~/.agent-link/registry/，AGENT_LINK_REGISTRY 可覆盖），框架适配器用它按本会话 session id 自动认领绑定；list-bindings 读取该索引（--root 接受但不使用）。
 
@@ -87,4 +92,4 @@ bind 配置 JSON：binding_id、run_id、native_task_id、parent={framework,sess
 
 ## 10. 已知限制
 
-单机可信 OS 用户、桌面消息管道需存活、文件轮询有延迟；不承诺应用重启后通知可用、不实现 exactly-once 外部投递。MCP/Intercom/OpenCode/zcode 适配和恢复策略留待后续版本。
+单机可信 OS 用户、桌面消息管道需存活、文件轮询有延迟；连接描述符支持应用重启后的新环境登记，但不保证管道实际存活或 hook 生命周期一定继承私有环境变量。仅对可证明未提交的失败提供显式人工恢复，不实现 exactly-once 外部投递，也不自动重试 unknown。MCP/Intercom/OpenCode/zcode 适配留待后续版本。

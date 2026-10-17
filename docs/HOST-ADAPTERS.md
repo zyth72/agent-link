@@ -10,6 +10,7 @@ agent_link/hosts/
   codex/
     __init__.py    # get_adapters
     parent.py      # 交互式 Codex 父端，通过桌面桥投递
+    connection.py  # 每 session 桌面传输描述符（白名单 env、旧宿主重连）
   pi/
     __init__.py    # get_adapters
     parent.py      # Pi 交互父端 HTTP 推送适配
@@ -45,7 +46,7 @@ TypeScript 扩展继续在 `extensions/<framework>/`，它们是加载到真实�
 
 父端适配统一由 `get_adapters().parent` 获取，子端由 `.child` 获取。服务支持 `--framework` 按框架选择；自定义驱动若保留 `--driver MODULE:OBJECT` 则仅是可扩展入口，不用于维持旧内置路径。旧 runtime 绑定与全局安装不自动迁移，新功能使用新worktree里的新绑定测试。
 
-Codex 父端 CLI 放在 `agent_link.hosts.codex.cli`；Pi RPC CLI 放在 `agent_link.hosts.pi.rpc`。旧 `agent_link.hosts.codex.cli`、`agent_link.adapter`、`hosts/omp_notifier.py` 不留转发。共享渲染器和文件桥移到中立 shared 模块，其他框架不得依赖Codex/OMP目录实现共享基础功能。TypeScript扩展如需相应整理，只保留一个权威实现，不复制旧入口。
+Codex 父端 CLI 放在 `agent_link.hosts.codex.cli`，连接描述符与 SessionStart hook 见 [CODEX](CODEX.md) 和 `hooks/hooks.json`；Pi RPC CLI 放在 `agent_link.hosts.pi.rpc`。旧 `agent_link.hosts.codex.cli`、`agent_link.adapter`、`hosts/omp_notifier.py` 不留转发。共享渲染器和文件桥移到中立 shared 模块，其他框架不得依赖Codex/OMP目录实现共享基础功能。TypeScript扩展如需相应整理，只保留一个权威实现，不复制旧入口。
 
 Codex 子端未实现时 `child=None`。生命周期能力（start/stop/status/steer）不是所有 ChildAdapter 的强制方法，Pi RPC 控制器通过单独能力接口提供；OpenCode 的 steer/interrupt 由自管 serve runner 子命令（`send --delivery`、`interrupt`）提供，不进入 ChildAdapter 接口。入口对象存在不等于进程已连接，需单独检查runtime状态。
 

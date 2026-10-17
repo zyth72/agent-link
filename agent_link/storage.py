@@ -23,13 +23,19 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .errors import ConflictError, NotFoundError, ValidationError
+from .errors import (
+    DELIVERY_DETAIL_PROTOCOL,
+    ConflictError,
+    NotFoundError,
+    ValidationError,
+)
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 DB_FILENAME = "agent_link.sqlite3"
@@ -415,6 +421,187 @@ class Store:
                 message_id=message_id,
                 detail={"state": state, "detail": detail},
             )
+
+    @staticmethod
+    def _delivery_metadata(detail):
+        """Return structured (certainty, reason) only for our own typed detail.
+
+        Historical plain error strings, including strings that merely contain
+        "ENOENT", are deliberately left unknown.  No error-string matching is
+        used to decide whether a replay is safe.
+        """
+        if not isinstance(detail, str):
+            return None, None
+        try:
+            value = json.loads(detail)
+        except (TypeError, ValueError):
+            return None, None
+        if not isinstance(value, dict) or value.get("protocol") != DELIVERY_DETAIL_PROTOCOL:
+            return None, None
+        if value.get("certainty") != "not_sent":
+            return None, None
+        reason = value.get("reason")
+        return "not_sent", reason if isinstance(reason, str) else None
+
+    def list_not_accepted_messages(self, binding_id: str) -> list[dict]:
+        """List this binding's report/ask messages not accepted by the host.
+
+        The caller must already have verified binding ownership through the
+        Codex helper; this query is binding-scoped and never scans another
+        chat.  Raw delivery error text is not returned, only the structured
+        submission certainty/reason when it is one of our typed details.
+        """
+        self.get_binding(binding_id)
+        rows = self.conn.execute(
+            "SELECT m.*, r.request_id AS request_id, r.question AS request_question,"
+            " r.status AS request_status, r.timeout_seconds AS request_timeout_seconds,"
+            " r.deadline_epoch AS request_deadline_epoch, r.answer AS request_answer,"
+            " r.reply_message_id AS request_reply_message_id, r.late AS request_late"
+            " FROM messages m LEFT JOIN requests r ON r.binding_id = m.binding_id"
+            " AND r.message_id = m.message_id"
+            " WHERE m.binding_id = ? AND m.kind IN ('report', 'ask')"
+            " AND m.delivery_state != 'host_accepted'"
+            " ORDER BY m.created_at, m.message_id",
+            (binding_id,),
+        ).fetchall()
+        results = []
+        for row in rows:
+            certainty, reason = self._delivery_metadata(row["delivery_detail"])
+            item = {
+                "message_id": row["message_id"],
+                "kind": row["kind"],
+                "delivery_state": row["delivery_state"],
+                "delivery_certainty": certainty,
+                "delivery_reason": reason,
+                "text": row["text"],
+                "created_at": row["created_at"],
+                "delivery_updated_at": row["delivery_updated_at"],
+            }
+            if row["kind"] == "ask":
+                item.update(
+                    {
+                        "request_id": row["request_id"],
+                        "question": row["request_question"],
+                        "timeout_seconds": row["request_timeout_seconds"],
+                        "deadline_epoch": row["request_deadline_epoch"],
+                        "reply_status": row["request_status"],
+                        "status": row["request_status"],
+                        "answer": row["request_answer"],
+                        "reply_message_id": row["request_reply_message_id"],
+                        "late": None if row["request_late"] is None else bool(row["request_late"]),
+                    }
+                )
+            results.append(item)
+        return results
+
+    def prepare_recovery(self, binding_id: str, message_ids=None) -> dict:
+        """Atomically claim only messages proven never submitted to the bridge.
+
+        A claim is a compare-and-set from ``failed_or_unknown`` with an exact
+        typed ``not_sent`` detail to ``dispatching``.  SQLite's write lock makes
+        this safe across processes.  Requests are never modified: deadlines
+        keep their original values, and expired asks or already answered/
+        timed-out requests are skipped.  Once claimed, a crash leaves the
+        message in ``dispatching`` and it is not recoverable again.
+        """
+        self.get_binding(binding_id)
+        requested = None
+        if message_ids is not None:
+            requested = []
+            for value in message_ids:
+                requested.append(validate_identifier(value, "message_id"))
+            requested = set(requested)
+        claimed = []
+        skipped = []
+        with self._write():
+            rows = self.conn.execute(
+                "SELECT m.*, r.request_id AS request_id, r.question AS request_question,"
+                " r.status AS request_status, r.timeout_seconds AS request_timeout_seconds,"
+                " r.deadline_epoch AS request_deadline_epoch"
+                " FROM messages m LEFT JOIN requests r ON r.binding_id = m.binding_id"
+                " AND r.message_id = m.message_id"
+                " WHERE m.binding_id = ? AND m.kind IN ('report', 'ask')"
+                " ORDER BY m.created_at, m.message_id",
+                (binding_id,),
+            ).fetchall()
+            by_id = {row["message_id"]: row for row in rows}
+            if requested is not None:
+                for message_id in sorted(requested - set(by_id)):
+                    skipped.append({"message_id": message_id, "reason": "unknown_message"})
+            for row in rows:
+                message_id = row["message_id"]
+                if requested is not None and message_id not in requested:
+                    continue
+                if row["delivery_state"] != "failed_or_unknown":
+                    skipped.append(
+                        {"message_id": message_id, "reason": f"state_{row['delivery_state']}"}
+                    )
+                    continue
+                certainty, reason = self._delivery_metadata(row["delivery_detail"])
+                if certainty != "not_sent":
+                    skipped.append(
+                        {"message_id": message_id, "reason": "submission_certainty_unknown"}
+                    )
+                    continue
+                if row["kind"] == "ask":
+                    if row["request_id"] is None:
+                        skipped.append({"message_id": message_id, "reason": "missing_request"})
+                        continue
+                    if row["request_status"] == "replied":
+                        skipped.append({"message_id": message_id, "reason": "request_replied"})
+                        continue
+                    if time.time() >= row["request_deadline_epoch"]:
+                        skipped.append({"message_id": message_id, "reason": "expired_ask"})
+                        continue
+                    if row["request_status"] != "pending":
+                        skipped.append(
+                            {
+                                "message_id": message_id,
+                                "reason": f"request_{row['request_status']}",
+                            }
+                        )
+                        continue
+                claim_id = secrets.token_hex(16)
+                claim_detail = canonical_json(
+                    {
+                        "protocol": DELIVERY_DETAIL_PROTOCOL,
+                        "certainty": "claimed",
+                        "claim_id": claim_id,
+                    }
+                )
+                cursor = self.conn.execute(
+                    "UPDATE messages SET delivery_state = 'dispatching', delivery_detail = ?,"
+                    " delivery_updated_at = ? WHERE binding_id = ? AND message_id = ?"
+                    " AND delivery_state = 'failed_or_unknown' AND delivery_detail = ?",
+                    (claim_detail, utc_now_iso(), binding_id, message_id, row["delivery_detail"]),
+                )
+                if cursor.rowcount != 1:
+                    skipped.append({"message_id": message_id, "reason": "claim_race"})
+                    continue
+                self._event(
+                    "recovery_claimed",
+                    binding_id=binding_id,
+                    message_id=message_id,
+                    request_id=row["request_id"],
+                    detail={"claim_id": claim_id, "previous_reason": reason},
+                )
+                item = {
+                    "message_id": message_id,
+                    "kind": row["kind"],
+                    "text": row["text"],
+                    "claim_id": claim_id,
+                }
+                if row["kind"] == "ask":
+                    item.update(
+                        {
+                            "request_id": row["request_id"],
+                            "question": row["request_question"],
+                            "timeout_seconds": row["request_timeout_seconds"],
+                            "deadline_epoch": row["request_deadline_epoch"],
+                        }
+                    )
+                claimed.append(item)
+        return {"claimed": claimed, "skipped": skipped}
 
     def prepare_report(self, binding_id: str, message_id: str, text: str) -> dict:
         validate_identifier(message_id, "message_id")

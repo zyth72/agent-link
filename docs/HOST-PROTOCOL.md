@@ -129,6 +129,8 @@ AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
   "driver": "agent_link.hosts.codex.parent:CodexParentAdapter",
   "notification_transport": "desktop_bridge",
   "notification_bridge": "binding.notifier_path (background-tasks notifier.py)",
+  "connection_registration": "session_start_hook_or_manual_per_session",
+  "connection_liveness": "unknown_registration_is_not_health",
   "receive_mode": "host_injection",
   "busy_behavior": "unknown",
   "wake_after_turn": "unknown"
@@ -147,10 +149,15 @@ AGENT_LINK_CREDENTIALS=/abs/runtime/child-credentials.json \
 
 默认 `agent_link.hosts.codex.parent:CodexParentAdapter`：
 
-- 只加载 binding 中记录的 `notifier_path`（bind 时固定、校验存在），调用其 `bridge(payload)`；消息内容只作为数据。
+- 只加载 binding 中记录的 `notifier_path`（bind 时固定、校验存在）；消息内容只作为数据。
 - 本机该路径是 background-tasks 插件的 `notifier.py`（WSL 桌面桥），需要父端桌面环境提供的 `CODEX_APP_TOOLS_PIPE_PATH` 等变量，并在内部调用应用 bundled codex-app-tools 的 send_message_to_thread。
+- 每次通知读取该父 session 的最新连接描述符（`~/.agent-link/codex-connections/`，`AGENT_LINK_CODEX_CONNECTIONS` 可覆盖；目录 0700、文件 0600）。描述符只保存 `protocol/framework/session_id/connection_generation/updated_at` 与白名单变量 `CODEX_APP_TOOLS_PIPE_PATH`、`CODEX_APP_TOOLS_CALLER_HOST_ID`。适配器复制当前环境后只覆盖这些字段，绝不修改 `os.environ`，因此旧宿主进程无需重启即可使用新登记管道。
+- 没有描述符时保持旧 `bridge(payload)` 行为（继承管道仍可用，generic bridge 仍兼容）。有描述符但 bridge 不接受 `env` 参数时 fail closed，不静默使用旧环境；描述符损坏/身份不匹配也明确失败。env-aware bridge 在无描述符且无继承管道时，可在调用前判定为未提交。
+- 登记来源：官方支持的 SessionStart hook（`hooks/hooks.json`，匹配 `startup|resume|clear|compact|fork`，JSON stdin 提供 session/source）、helper/main 启动时的当前管道环境、以及 helper `register-connection` 手动兜底。缺管道时自动登记跳过且不覆盖旧描述符。登记/描述符不是存活或模型处理证据；`connection-status` 不做探针时不声称传输 live。
 - 因此：**服务只能在父端环境启动**；子端环境没有这些依赖。
 - 桥返回只记录为 `host_accepted`；模型是否处理必须由父端实际 `reply` 证明。
+
+失败与恢复：只有桥调用前可证明未提交的失败（缺连接/管道、描述符无效、bridge 不支持 env）写结构化 `certainty=not_sent`；桥调用后的 ENOENT/超时/异常仍为 unknown，禁止按错误字符串分类。`recover-notifications` 仅显式重放 not_sent 消息，使用跨进程 SQLite compare-and-set 领取，不重置 deadline，跳过过期/已回答 ask，不重放 host_accepted/dispatching/unknown；无 force 模式。
 
 父端的发现、查询与回复推荐使用 Codex 专用薄 CLI `python3 -m agent_link.hosts.codex.cli`：它按本会话 session id 从注册表发现条目，用 SQLite 只读模式校验 root 与归属后才复用核心指令，**不接受消息里的 `--root`**。用法、校验规则与 background-tasks 启动顺序见 [CODEX.md](CODEX.md)。
 
@@ -199,7 +206,7 @@ Pi 和 OMP 使用 session-owned loopback HTTP 接口，按权威 Binding 的框�
 
 ### 6.2 两种索引的职责
 
-Binding 注册表 `~/.agent-link/registry/` 记录任务会话关联，SQLite 仍是权威。Pi/OMP 会话连接目录 `~/.agent-link/sessions/`（AGENT_LINK_SESSIONS 可覆盖）只记录活跃扩展的 endpoint/token，不存消息；发送时按需查找，无需定时扫描。OpenCode 在该目录下使用独立的会话/serve 描述符（§6.3），同样按需读取；其旧 watcher 与自动认领已删除。
+Binding 注册表 `~/.agent-link/registry/` 记录任务会话关联，SQLite 仍是权威。Pi/OMP 会话连接目录 `~/.agent-link/sessions/`（AGENT_LINK_SESSIONS 可覆盖）只记录活跃扩展的 endpoint/token，不存消息；发送时按需查找，无需定时扫描。OpenCode 在该目录下使用独立的会话/serve 描述符（§6.3），同样按需读取；其旧 watcher 与自动认领已删除。Codex 桌面传输环境使用独立的 `~/.agent-link/codex-connections/` 描述符（`AGENT_LINK_CODEX_CONNECTIONS` 可覆盖），仅存传输白名单变量，不存 token/消息。
 
 ### 6.3 OpenCode 描述符契约（契约冻结，实现跟随）
 
@@ -301,6 +308,7 @@ PI_CODING_AGENT_ROOT=<pi 包根> node tests/pi/extension_unit.test.mjs
 - `tests/test_omp_extension.py`：真实 OMP 扩展的模拟上下文与本地 HTTP 注入，以及无模型注册；共享接收逻辑与 Pi 同源。
 - `tests/test_parent_requests.py`：请求/答复状态、幂等、冲突、超时与迟到；OpenCode prompt 推送闭环仍有专门覆盖。
 - `tests/test_codex.py`、`tests/test_registry.py`：父端发现、归属校验和注册表行为。
+- `tests/test_codex_connection.py`：Codex 连接描述符、按调用 env 覆盖、旧宿主无重启重连、跨会话隔离、缺管道 not_sent、调用后 unknown 不重放、过期/已回答 ask 跳过、并发安全恢复、SessionStart hook 假 stdin 与插件/hooks 结构（不发真实消息、不调用模型）。
 - `tests/test_opencode_extension.py`：OpenCode v2 工具、原生 prompt 推送宿主闭环与隔离环境插件注册（已删除 watcher 套件）。
 
 当前测试矩阵和真实模型证据以 [SESSION-PUSH](SESSION-PUSH.md)、[PI-RPC](PI-RPC.md) 与各框架 README 为准。历史文件桥验收不等于主动推送验收。Pi/OMP 正式扩展已通过真实 DeepSeek 的空闲通知和 ask/reply 闭环；工具运行中的消息注入已由真实模型验证；计划模式、中断竞争、会话切换、重连仍需分别验证。OpenCode 已完成三层验收：模拟（`test_opencode_push.py`）、真实隔离 serve 无模型（`test_opencode_serve.py`，含 B 组）与模型端到端（切片 3c，C1–C6 见 §6.3）；插件 watcher 已删除；Codex 子端未实现。

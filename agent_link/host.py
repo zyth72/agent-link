@@ -23,7 +23,7 @@ import threading
 from typing import Any
 
 from . import cli
-from .errors import AgentLinkError, NotFoundError, ValidationError
+from .errors import AgentLinkError, NotFoundError, NotificationNotSent, ValidationError
 from .hosts.base import load_adapters
 from .registry import entry_from_row, write_entry
 from .storage import Store
@@ -90,6 +90,15 @@ class HostService(ThreadingHTTPServer):
         store.mark_dispatching(self.binding_id, message["message_id"])
         try:
             detail = self.driver.notify(store.root, binding, message)
+        except NotificationNotSent as error:
+            # Proven before the bound bridge was invoked; keep the structured
+            # not-sent detail so explicit recovery can safely replay it.
+            store.mark_delivery(
+                self.binding_id,
+                message["message_id"],
+                "failed_or_unknown",
+                error.delivery_detail(),
+            )
         except Exception as error:  # noqa: BLE001 - external driver failure
             store.mark_delivery(
                 self.binding_id,
@@ -359,6 +368,20 @@ def main() -> int:
             store.close()
     except AgentLinkError as error:
         parser.error(str(error))
+
+    # A Codex host launched from the current desktop environment registers the
+    # freshest transport for its parent session.  Missing pipe env is a no-op
+    # and never overwrites an existing descriptor.  Registration is not a
+    # health check: readiness below only covers this loopback service.
+    if binding_row["parent_framework"] == "codex-desktop":
+        try:
+            from .hosts.codex import connection as codex_connection
+
+            codex_connection.maybe_register_connection(binding_row["parent_session_id"])
+        except AgentLinkError as error:
+            print(f"agent-link: codex connection registration skipped: {error}", file=sys.stderr)
+        except OSError as error:
+            print(f"agent-link: codex connection registration failed: {error}", file=sys.stderr)
 
     # Refresh the user-level registry entry so framework adapters can discover
     # this binding by session id (see agent_link/registry.py); a failure here

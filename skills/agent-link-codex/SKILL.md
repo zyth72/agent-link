@@ -19,6 +19,10 @@ python3 LINK --codex --session-id CURRENT_THREAD --binding BINDING get-request -
 python3 LINK --codex --session-id CURRENT_THREAD --binding BINDING reply --request-id REQUEST --message-id NEW_REPLY_ID --answer "父端决定"
 python3 LINK --codex --session-id CURRENT_THREAD --binding BINDING ask-child --request-id REQUEST --message-id NEW_ID --question "具体问题" --timeout 240
 python3 LINK --codex --session-id CURRENT_THREAD --binding BINDING list-parent-requests --pending
+python3 LINK --codex --session-id CURRENT_THREAD --binding BINDING notifications
+python3 LINK --codex --session-id CURRENT_THREAD --binding BINDING recover-notifications
+python3 LINK --codex --session-id CURRENT_THREAD register-connection
+python3 LINK --codex --session-id CURRENT_THREAD connection-status
 ```
 
 - `list` 只取注册表中 `parent.framework=codex-desktop` 且 `parent.session_id` 等于本会话的条目，并对每个条目的 root 下既有 SQLite 做**只读**校验（父会话归属、run_id、config_digest、child 标识）。坏条目/缺 root/缺数据库以 `rejected` + 原因列出，绝不自动建库。
@@ -28,6 +32,19 @@ python3 LINK --codex --session-id CURRENT_THREAD --binding BINDING list-parent-r
 - `host_accepted` 只表示宿主接受，不表示模型已处理；是否处理由持久化答复证明。ask-child 超时 exit 3，迟到答复仍可查询（`late=true`）。
 
 校验细节、退出码与错误 JSON 见 [references/codex-parent.md](references/codex-parent.md)。
+
+## 连接自动登记与重启恢复
+
+Codex 应用重启后旧宿主进程的 `CODEX_APP_TOOLS_PIPE_PATH` 会过期。仓库根现在包含真实的 Codex 插件清单与 SessionStart hook：
+
+- `.codex-plugin/plugin.json` 显式指向 `hooks/hooks.json`；SessionStart 匹配 `startup|resume|clear|compact|fork`，读取 JSON stdin 的 `hook_event_name/session_id/source`，用当前继承的管道环境登记父 session，不依赖 cwd、不需要模型。
+- 用户在 Codex 插件设置中把仓库根作为本地插件源并**显式信任 hooks**后才会执行；测试不会修改真实配置/缓存/信任。
+- 若真实版本未把私有管道环境传给 hook，在父会话当前工具环境手动执行 `LINK --codex --session-id CURRENT_THREAD register-connection`（不需要已有 binding）。这是兜底，不是自动 hook。
+- `connection-status` 只显示安全的本地描述符元数据（session/generation/允许的 env key），不显示管道地址，也不声称进程或传输存活。登记成功不等于健康检查。
+
+离线消息保留原文与 deadline。`notifications` 在 helper 完成注册表/SQLite 归属校验后列出本 binding 未 accepted 的 report/ask（含原文、request id、问题、deadline、答复状态）。`recover-notifications` 只显式重放桥调用前可证明未提交的 `not_sent` 失败：原子领取、保留消息 id/deadline、跳过过期或已回答 ask，绝不重放 host_accepted/dispatching/unknown，也没有 force-unknown。桥调用后的 ENOENT/超时/异常保持 unknown。恢复成功仍只是 `host_accepted`，模型是否处理由真实 reply 证明。
+
+官方插件/hook 文档确认 hook 发现、显式路径、SessionStart 与 trust 要求；私有管道环境是否被真实 SessionStart 生命周期继承未由官方保证，需用户信任 hook 后用真实 app resume 验证，当前保持 unknown。
 
 ## 绑定新任务
 

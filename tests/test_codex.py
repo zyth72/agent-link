@@ -19,7 +19,7 @@ from pathlib import Path
 from agent_link.hosts.codex.parent import CodexParentAdapter, build_codex_parent_prompt
 from agent_link.shared import build_parent_prompt
 from agent_link.storage import Store
-from tests import isolate_registry
+from tests import isolate_codex_connections, isolate_registry
 from tests.opencode_server import MockOpenCodeServe, write_descriptor_pair
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -45,6 +45,7 @@ def bridge(payload):
 class CodexCase(unittest.TestCase):
     def setUp(self):
         self.registry = Path(isolate_registry(self))
+        self.connections = Path(isolate_codex_connections(self))
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.work = Path(self.tmp.name)
@@ -62,6 +63,8 @@ class CodexCase(unittest.TestCase):
         env.pop("AGENT_LINK_REPO", None)
         env.pop("CODEX_THREAD_ID", None)
         env.pop("CODEX_SESSION_ID", None)
+        env.pop("CODEX_APP_TOOLS_PIPE_PATH", None)
+        env.pop("CODEX_APP_TOOLS_CALLER_HOST_ID", None)
         if extra:
             env.update(extra)
         return env

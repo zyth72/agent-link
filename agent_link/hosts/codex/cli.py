@@ -21,6 +21,9 @@ The session id comes from an explicit ``--session-id`` or, when running inside
 the Codex chat, from ``CODEX_THREAD_ID`` / ``CODEX_SESSION_ID``.  No session id
 is hardcoded anywhere.
 
+It also exposes ``register-connection`` (manual fallback / startup helper),
+``connection-status`` (safe local descriptor metadata only) and
+``notifications`` / ``recover-notifications`` for persisted offline messages.
 It offers the minimal RPC-child commands ``child-status``
 (on-demand controller get_state) and ``stop-child``.  The non-blocking
 ``send-child`` is a core CLI operation: the helper only resolves and verifies
@@ -52,6 +55,7 @@ from ... import cli
 from ...errors import AgentLinkError, NotFoundError, ValidationError
 from ...hosts.pi import rpc as pi_rpc
 from ...registry import REGISTRY_VERSION, registry_dir
+from . import connection
 from ...storage import (
     DB_FILENAME,
     Store,
@@ -71,6 +75,7 @@ OPERATION_HANDLERS = {
     "get-request": cli.cmd_get_request,
     "get-parent-request": cli.cmd_get_parent_request,
     "list-parent-requests": cli.cmd_list_parent_requests,
+    "recover-notifications": cli.cmd_recover_notifications,
 }
 
 
@@ -330,6 +335,49 @@ def _verify_store_row(row: dict, candidate: dict) -> None:
         )
 
 
+def _auto_register_connection(explicit_session_id):
+    """Helper-entry auto-registration with the current inherited pipe env.
+
+    This runs on every helper invocation (and is the same routine the
+    SessionStart hook calls) so a fresh desktop environment can supersede an
+    old per-session descriptor.  It never writes when the pipe env is absent,
+    and it never registers a session other than the trusted current one.
+    """
+    if not os.environ.get(connection.PIPE_ENV):
+        return None
+    try:
+        return connection.maybe_register_connection(explicit_session_id)
+    except AgentLinkError as error:
+        print(f"agent-link: codex connection auto-registration skipped: {error}", file=sys.stderr)
+        return None
+
+
+def command_register_connection(explicit_session_id):
+    """Explicit manual registration; works without an existing binding."""
+    result = connection.register_connection(explicit_session_id)
+    result["note"] = "registration is not transport liveness; no probe was attempted"
+    return result, 0
+
+
+def command_connection_status(explicit_session_id):
+    """Report safe local descriptor metadata only; never a liveness claim."""
+    session_id = connection.resolve_session_id(explicit_session_id)
+    result = connection.connection_status(session_id)
+    result["note"] = "descriptor metadata only; transport/process liveness is unknown"
+    return result, 0
+
+
+def command_notifications(store: Store, binding: dict, session_id: str):
+    """List this verified binding's pending/not-accepted messages."""
+    return {
+        "session_id": session_id,
+        "binding_id": binding["binding_id"],
+        "parent_session_id": binding["parent_session_id"],
+        "messages": store.list_not_accepted_messages(binding["binding_id"]),
+        "note": "persisted or failed_or_unknown; host_accepted is not model processing",
+    }, 0
+
+
 def _cmd_child_status(store: Store, binding: dict, args):
     """Read the Pi RPC descriptor and query the controller on demand."""
     result = {
@@ -398,6 +446,8 @@ def _run_operation(args, candidate: dict):
             result, exit_code = _cmd_child_status(store, row, namespace)
         elif args.command == "stop-child":
             result, exit_code = _cmd_stop_child(store, row, namespace)
+        elif args.command == "notifications":
+            result, exit_code = command_notifications(store, row, candidate["parent"]["session_id"])
         else:
             result, exit_code = OPERATION_HANDLERS[args.command](store, namespace)
     finally:
@@ -456,6 +506,31 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("list", help="list and verify this session's registered bindings").add_argument(
         "--binding", default=argparse.SUPPRESS, metavar="ID"
     )
+    sub.add_parser(
+        "register-connection",
+        help="register this Codex session's current desktop pipe env (no binding required)",
+    )
+    sub.add_parser(
+        "connection-status",
+        help="show safe local connection metadata (does not probe transport liveness)",
+    )
+    p = sub.add_parser(
+        "notifications",
+        help="list this binding's pending/not-accepted messages with original text",
+    )
+    p.add_argument("--binding", default=argparse.SUPPRESS)
+    p = sub.add_parser(
+        "recover-notifications",
+        help="explicitly replay only messages proven not submitted before the bridge call",
+    )
+    p.add_argument("--binding", default=argparse.SUPPRESS)
+    p.add_argument(
+        "--message-id",
+        action="append",
+        dest="message_ids",
+        metavar="ID",
+        help="only recover this message id (repeatable); default is all safe failures",
+    )
     p = sub.add_parser("reply", help="answer an existing child request with a fresh reply id")
     p.add_argument("--binding", default=argparse.SUPPRESS)
     p.add_argument("--request-id", required=True, dest="request_id")
@@ -501,12 +576,19 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        session_id = _resolve_session_id(args.session_id)
-        if args.command == "list":
-            result, exit_code = command_list(session_id, args.binding)
+        if args.command == "register-connection":
+            result, exit_code = command_register_connection(args.session_id)
         else:
-            candidate = _resolve_binding(session_id, args.binding)
-            result, exit_code = _run_operation(args, candidate)
+            _auto_register_connection(args.session_id)
+            if args.command == "connection-status":
+                result, exit_code = command_connection_status(args.session_id)
+            else:
+                session_id = _resolve_session_id(args.session_id)
+                if args.command == "list":
+                    result, exit_code = command_list(session_id, args.binding)
+                else:
+                    candidate = _resolve_binding(session_id, args.binding)
+                    result, exit_code = _run_operation(args, candidate)
     except AgentLinkError as error:
         print(f"{error.code}: {error}", file=sys.stderr)
         payload = {"error": error.code, "message": str(error)}

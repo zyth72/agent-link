@@ -12,7 +12,12 @@ import time
 import traceback
 
 from . import __version__
-from .errors import AgentLinkError, DeliveryFailure, ValidationError
+from .errors import (
+    AgentLinkError,
+    DeliveryFailure,
+    NotificationNotSent,
+    ValidationError,
+)
 from .hosts.base import load_adapters
 from .registry import entry_from_row, list_bindings, registry_dir, write_entry
 from .storage import Store, require_text, validate_identifier, validate_timeout_seconds
@@ -30,6 +35,9 @@ CAPABILITIES = {
     "adapters": {
         "codex-desktop": {
             "notification_transport": "desktop_bridge",
+            "connection_registration": "session_start_hook_or_manual_per_session",
+            "connection_liveness": "unknown_registration_is_not_health",
+            "delivery_recovery": "explicit_not_sent_only",
             "receive_mode": "host_injection",
             "busy_behavior": "unknown",
             "wake_after_turn": "unknown",
@@ -93,12 +101,28 @@ def _child_adapter(binding: dict):
     return adapters.child
 
 
-def _dispatch(store: Store, binding_id: str, message: dict):
-    """Persist dispatching state, run the external call, record the outcome."""
+def _dispatch(store: Store, binding_id: str, message: dict, *, claimed: bool = False):
+    """Run one external notification and record its persisted delivery outcome.
+
+    ``claimed=True`` is used by recover-notifications after an atomic recovery
+    claim already moved the message to ``dispatching``.  Only a typed
+    ``NotificationNotSent`` (proven before invoking the bridge) stores the
+    structured not-sent detail; bridge exceptions stay unknown plain errors.
+    """
     binding = store.get_binding(binding_id)
-    store.mark_dispatching(binding_id, message["message_id"])
+    if not claimed:
+        store.mark_dispatching(binding_id, message["message_id"])
     try:
         detail = _parent_adapter(binding).notify(store.root, binding, message)
+    except NotificationNotSent as exc:
+        error = str(exc)
+        store.mark_delivery(
+            binding_id,
+            message["message_id"],
+            "failed_or_unknown",
+            exc.delivery_detail(),
+        )
+        return None, error
     except Exception as exc:  # noqa: BLE001 - external transport failure
         error = f"{type(exc).__name__}: {exc}"
         store.mark_delivery(binding_id, message["message_id"], "failed_or_unknown", error)
@@ -246,6 +270,58 @@ def cmd_ask(store: Store, args) -> tuple[dict, int]:
     }
     return result, 0 if final["status"] == "replied" else 3
 
+
+
+def cmd_recover_notifications(store: Store, args) -> tuple[dict, int]:
+    """Explicitly replay only messages proven never submitted to the bridge.
+
+    There is no force/unknown mode.  Claims are atomic per message across
+    processes and do not alter request rows or deadlines.  Expired asks and
+    answered/timed-out requests are skipped; a successful bridge call is still
+    only ``host_accepted``, not proof that the parent model processed it.
+    """
+    binding_id = validate_identifier(args.binding, "binding_id")
+    message_ids = getattr(args, "message_ids", None)
+    prepared = store.prepare_recovery(binding_id, message_ids)
+    binding = store.get_binding(binding_id)
+    attempted = []
+    failed = False
+    for item in prepared["claimed"]:
+        message = {
+            "kind": item["kind"],
+            "message_id": item["message_id"],
+            "text": item["text"],
+        }
+        if item["kind"] == "ask":
+            message.update(
+                {
+                    "request_id": item["request_id"],
+                    "question": item["question"],
+                    "timeout_seconds": item["timeout_seconds"],
+                    "deadline_epoch": item["deadline_epoch"],
+                }
+            )
+        _, error = _dispatch(store, binding_id, message, claimed=True)
+        state = store.get_delivery_state(binding_id, item["message_id"])
+        entry = {
+            "message_id": item["message_id"],
+            "kind": item["kind"],
+            "delivery_state": state,
+            "recovered": state == "host_accepted",
+        }
+        if error:
+            entry["error"] = error
+        if state != "host_accepted":
+            failed = True
+        attempted.append(entry)
+    result = {
+        "binding_id": binding_id,
+        "parent_session_id": binding["parent_session_id"],
+        "attempted": attempted,
+        "skipped": prepared["skipped"],
+        "delivery_note": "host_accepted is not model processing confirmation",
+    }
+    return result, 7 if failed else 0
 
 def cmd_reply(store: Store, args) -> tuple[dict, int]:
     binding_id = validate_identifier(args.binding, "binding_id")
@@ -453,6 +529,7 @@ HANDLERS = {
     "get-parent-request": cmd_get_parent_request,
     "list-parent-requests": cmd_list_parent_requests,
     "list-bindings": cmd_list_bindings,
+    "recover-notifications": cmd_recover_notifications,
 }
 
 
@@ -524,6 +601,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("list-parent-requests", help="list parent-initiated requests for a binding")
     p.add_argument("--binding", required=True)
     p.add_argument("--pending", action="store_true", help="only requests still waiting for an answer")
+
+    p = sub.add_parser(
+        "recover-notifications",
+        help="explicitly replay only notifications proven not submitted before the bridge call",
+    )
+    p.add_argument("--binding", required=True)
+    p.add_argument(
+        "--message-id",
+        action="append",
+        dest="message_ids",
+        metavar="ID",
+        help="only recover this message id (repeatable); default is all safe failures",
+    )
 
     p = sub.add_parser(
         "list-bindings",

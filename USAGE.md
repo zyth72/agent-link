@@ -191,7 +191,8 @@ python3 -m agent_link.hosts.codex.cli --session-id CURRENT_THREAD --binding BIND
   list-parent-requests --pending
 ```
 
-- 支持 `list`、`reply`、`ask-child`、`send-child`、`get-request`、`get-parent-request`、`list-parent-requests`；`ask-child`/`send-child` 参数与核心 CLI 同名，且 `send-child` 直接复用核心 handler，JSON 与退出码不变。
+- 支持 `list`、`reply`、`ask-child`、`send-child`、`get-request`、`get-parent-request`、`list-parent-requests`、`notifications`、`recover-notifications`、`register-connection`、`connection-status`；后两组不需要已有 binding（`connection-status` 仅本地元数据，不探测存活）。`ask-child`/`send-child` 参数与核心 CLI 同名，且 `send-child` 直接复用核心 handler，JSON 与退出码不变。
+- `notifications` 只在 helper 完成注册表 + SQLite 只读归属校验后读取本 binding 未 accepted 的 report/ask；`recover-notifications` 仅显式重放桥调用前可证明未提交的 `not_sent` 消息，原子领取、保留 deadline、跳过过期/已回答 ask，不重放 host_accepted/dispatching/unknown，无 force 模式。
 - **不接受 `--root`**；坏条目/缺 root/缺数据库在 `list` 中作为 `rejected` 带原因返回，不自动建库，也不会把消息里的 root 当成执行目标。
 - 仅当恰好一个候选通过校验时才能省略 `--binding`；多条匹配必须显式选择。
 - `ask-child` 阻塞；长等待放进 background-tasks 后台任务。`send-child` 非阻塞（交付后立即返回 0/7），适合父端随时下发消息。能否唤醒子端取决于子端适配器（Pi 使用 RPC 或 session HTTP；OMP 使用 session HTTP；OpenCode 使用原生 prompt 推送；Codex 子端未实现）；busy 时是否可达以模型端到端验收为准。
@@ -211,7 +212,7 @@ python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v
 ## 已知限制
 
 - 单机、同一 OS 可信用户；不防范恶意同用户进程。
-- 依赖父端桌面消息管道存活；WSL→Windows 通知需要 `CODEX_APP_TOOLS_PIPE_PATH` 等环境变量（由 Codex 桌面会话注入）。宿主服务也会加载同一 binding 的 notifier，因此必须由父端环境启动。
+- 依赖父端桌面消息管道存活；WSL→Windows 通知需要 `CODEX_APP_TOOLS_PIPE_PATH` 等环境变量（由 Codex 桌面会话注入）。Codex 每 session 连接描述符（默认 `~/.agent-link/codex-connections/`）可让旧宿主在应用重启后用新登记管道；登记不是存活检查。SessionStart hook 已打包，但真实生命周期是否继承私有管道 env 需用户信任 hook 后用 app resume 验证，当前 unknown。宿主服务也会加载同一 binding 的 notifier，因此仍必须由父端环境启动。
 - loopback 宿主服务只承诺同机、单 binding/单 token、子端不能 bind/reply；不承诺跨机器、MCP、Intercom 兼容或恶意同用户隔离。
 - 文件/数据库轮询有延迟（默认 0.1s），不承诺应用重启后通知可用，不实现 exactly-once 外部投递。
 - 墙钟回拨可能影响迟到判定；已记录 `wall_clock_jump_observed` 审计事件，但无法消除该限制。

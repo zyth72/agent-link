@@ -12,6 +12,10 @@
 | `get-request` | `--request-id` | 0 / 5 / 6 |
 | `get-parent-request` | `--request-id` | 0 / 5 / 6 |
 | `list-parent-requests` | `[--pending]` | 0 / 5 / 6 |
+| `notifications` | 无 | 0 / 5 / 6 |
+| `recover-notifications` | `[--message-id ID ...]` | 0 / 5 / 6 / 7 |
+| `register-connection` | 无（不需要 binding） | 0 / 5 |
+| `connection-status` | 无（不需要 binding） | 0 / 5 |
 
 `--session-id` 是全局参数；`--binding` 也是全局参数，也可写在各子命令后。会话 id 缺省读 `CODEX_THREAD_ID` / `CODEX_SESSION_ID`；都取不到 exit 5。
 
@@ -36,6 +40,16 @@
 ## 错误 JSON
 
 错误 stdout 为 `{"error", "message", ...}`，发现类错误额外带 `bindings` 数组；诊断也写 stderr。`reply` 冲突（已答复/跨请求 message_id）exit 4，未知请求 exit 6。
+
+## 连接登记、离线恢复与 SessionStart hook
+
+连接描述符位于 `~/.agent-link/codex-connections/<session_id>.json`（`AGENT_LINK_CODEX_CONNECTIONS` 可覆盖；目录 0700、文件 0600），只保存 protocol/session/generation/update time 与 `CODEX_APP_TOOLS_PIPE_PATH`、`CODEX_APP_TOOLS_CALLER_HOST_ID`。通知每次读取最新描述符，复制环境后只覆盖传输字段；不改全局环境。新管道原子递增 generation，同环境重放幂等，缺管道不覆盖旧值，跨会话不能重定向。
+
+`register-connection` 使用当前继承的管道环境手动登记，不需要已有 binding；显式 session 与当前 `CODEX_THREAD_ID`/`CODEX_SESSION_ID` 不一致会被拒绝。`connection-status` 仅报告本地元数据，不探测传输存活。
+
+插件清单 `.codex-plugin/plugin.json` 指向 `hooks/hooks.json`；SessionStart hook（`startup|resume|clear|compact|fork`）读取 JSON stdin 的 `hook_event_name/session_id/source`，用当前管道环境执行同一登记函数。插件必须由用户显式信任 hook；若真实版本不把私有管道环境传给 hook，用手动 `register-connection` 兜底。官方文档未保证该私有 env 的 hook 继承，真实 app resume 验证前保持 unknown。
+
+`notifications` 在已完成注册表 + 只读 SQLite 归属校验后列出本 binding 未 accepted 的 report/ask（原文、request id、问题、deadline、答复状态）。`recover-notifications` 只重放桥调用前可证明未提交的 `not_sent` 失败：SQLite compare-and-set 原子领取、保留消息 id 与 deadline、跳过过期/已回答 ask、不重放 host_accepted/dispatching/unknown。桥调用后的 ENOENT/超时/异常保持 unknown，不按错误字符串匹配，也不自动重试；没有 force-unknown 或 exactly-once 承诺。
 
 ## ask-child 与 background-tasks
 

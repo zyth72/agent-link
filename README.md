@@ -57,6 +57,25 @@ export { default } from "/abs/path/to/agent-link/extensions/pi/agent-link.ts";
 
 `skills/agent-link/` 是共享壳（通用规则与 `scripts/link.py`），父端流程按宿主分册：`skills/agent-link-codex/`（Codex 桌面）、`skills/agent-link-omp/`（OMP）。安装时共享壳与当前宿主的分册都要对父端可见；独立安装副本由安装方在 `link.py` 旁写入 `repo-location.json`（本机产物，不入库）。OMP 用户级技能目录为 `~/.agents/skills/`（可用软链接指向仓库内分册）；Codex 按既有同步方式复制 skill 目录。
 
+### Codex 插件与 SessionStart hook（连接恢复）
+
+仓库根包含最小 Codex 插件清单 `.codex-plugin/plugin.json`，显式指向 `hooks/hooks.json`。SessionStart hook 匹配 `startup|resume|clear|compact|fork`，读取 JSON stdin 的 `hook_event_name/session_id/source`，用当前继承的桌面管道环境登记父 session；不需要模型，也不依赖 cwd：
+
+```sh
+python3 "$PLUGIN_ROOT/hooks/session_start.py"
+```
+
+安装与信任步骤（需要用户在真实 Codex 中操作）：
+
+1. 将仓库根作为本地插件源加入 Codex（或复制/链接整个仓库根，至少包含 `.codex-plugin/`、`hooks/`、`agent_link/`、`skills/`）。
+2. 显式信任/批准 Agent Link 的 hooks。官方插件机制要求用户信任，未信任时 hook 不会运行。
+3. 启动或 resume 会话后，可用 `python3 -m agent_link.hosts.codex.cli --session-id CURRENT connection-status` 查看安全的本地描述符元数据；它不显示管道地址，也不证明传输/进程存活。
+4. 如果实际版本没有把私有 `CODEX_APP_TOOLS_PIPE_PATH` 传给 hook，在父会话当前工具环境中手动兜底：
+   `python3 -m agent_link.hosts.codex.cli --session-id CURRENT register-connection`
+   （不需要已有 binding）。
+
+连接描述符保存在 `~/.agent-link/codex-connections/`（`AGENT_LINK_CODEX_CONNECTIONS` 可覆盖；目录 0700、文件 0600），只存白名单传输变量，不存完整环境/凭据/消息。通知每次读取最新描述符，复制环境后只覆盖传输字段，不修改 `os.environ`；旧宿主无需重启即可使用新登记管道。官方文档未保证私有管道 env 会被真实 SessionStart 生命周期继承，需用户信任 hook 后用真实 app resume 验证，当前保持 unknown。失败消息只在**桥调用前**可证明未提交时写结构化 `not_sent`；`recover-notifications` 显式、原子地只重放这些消息，跳过过期/已回答 ask，不重试 unknown，也不提供 force 或 exactly-once。
+
 ## 项目结构
 
 ```text
@@ -68,6 +87,7 @@ agent_link/          # Python 包：CLI、SQLite 状态机、通知适配器、�
   hosts/pi/         # Pi 父子适配与 RPC 控制器
   hosts/omp/        # OMP 父子适配
   hosts/opencode/   # OpenCode 父子适配（原生 prompt HTTP 推送；描述符契约）
+  hosts/codex/connection.py # Codex 每 session 桌面连接描述符（白名单传输 env）
   shared.py         # 公共消息渲染与文件桥工具（OpenCode Python 适配已不引用）
 extensions/
   shared/agent-link-client.ts            # Pi/OMP/OpenCode 共用的子端 HTTP 客户端
@@ -75,6 +95,8 @@ extensions/
   pi/agent-link.ts                       # Pi 子端四工具 + 会话推送
   omp/agent-link.ts                      # OMP 五个工具 + 会话推送
   opencode/agent-link.ts                 # OpenCode v2 插件：五个子端工具（消息投递由 Python 适配器原生 prompt 推送）
+hooks/               # Codex SessionStart hook（connection 登记；无模型）
+.codex-plugin/       # 最小 Codex 插件清单（skills + hooks 路径）
 tests/               # unittest 测试（模拟 notifier/driver，不发真实桌面消息）
   pi/                # Node/jiti 扩展测试与真实 HTTP 闭环驱动脚本
   omp/               # Bun 扩展测试 harness 与桥验收驱动脚本
@@ -193,8 +215,8 @@ python3 -m pip install -e . --no-deps   # 开发模式
 
 - 同一 OS 可信用户模型：runtime 目录 0700、数据库 0600、子端凭据 0600；不防范恶意同用户进程。
 - 适配器只加载绑定时指定的本机 `notifier.py`；消息内容仅作数据传递，不作为代码执行。宿主服务只监听 127.0.0.1，单 binding/单 token；子端不能 `bind`/`reply`/指定父会话。
-- 依赖父端宿主消息管道存活；宿主服务必须由父端环境启动（当前 Codex 驱动依赖 background-tasks 桌面桥）。投递成功仅表示宿主接口接受（`host_accepted`），不代表模型已处理；模型是否处理由父端实际答复证明。
-- 不自动重试通知，不实现 exactly-once 外部投递；墙钟回拨只能记录 `wall_clock_jump_observed`，不能消除影响。
+- 依赖父端宿主消息管道存活；宿主服务必须由父端环境启动（当前 Codex 驱动依赖 background-tasks 桌面桥）。投递成功仅表示宿主接口接受（`host_accepted`），不代表模型已处理；模型是否处理由父端实际答复证明。连接登记/hook 成功也不是存活检查。
+- 不自动重试通知，不实现 exactly-once 外部投递；仅对桥调用前可证明未提交的失败提供显式人工恢复，unknown 永不自动重放。墙钟回拨只能记录 `wall_clock_jump_observed`，不能消除影响。
 - v0.1 不支持 `spawn` / `cancel`，不能绑定未启动的任务，不实现自动清理。
 
 ## 许可证
